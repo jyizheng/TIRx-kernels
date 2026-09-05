@@ -297,7 +297,8 @@ def _descriptor_with_address(base, shared_address):
 def _instruction_descriptor(inst_m, inst_n, ab_dtype, sf_dtype):
     sf_format = {"float8_e4m3fn": 0, "float8_e8m0fnu": 1, "float8_e5m3fnu": 2}[sf_dtype]
     if ab_dtype == "float4_e2m1fn":
-        value = (1 << 3) | (1 << 7) | (1 << 10)
+        # PTX FP4 descriptor: K128 and SM107 sparsity-version v1 (also for dense MMA).
+        value = (1 << 3) | (1 << 7) | (1 << 10) | (1 << 12)
     else:
         value = 1 << 31
         if ab_dtype == "float8_e5m2":
