@@ -291,7 +291,8 @@ _MBARRIER_INIT = (
     (_MBAR_CORR_SIG + 8, 32),
     (_MBAR_P_STORE_TURN, 32),
     (_MBAR_P_STORE_TURN + 8, 32),
-    (_MBAR_O_FULL, 1),
+    # Epilogue needs final PV completion and row state from both score warps.
+    (_MBAR_O_FULL, 1 + 2 * 32),
     (_MBAR_DECODE_DONE, 32),
 )
 
@@ -638,11 +639,6 @@ def _build_kernel():
                         _flip(p_store_phase)
                     _mbar_arrive(_bar(smem, _MBAR_P_FULL) + K.cast(stage, "uint32") * _u32(8))
 
-                # Correction's P_FULL arrival acknowledges the final CORR_SIG.
-                # Reuse the score phase: S_FULL and P_FULL advance once per pair.
-                _mbar_wait(
-                    _bar(smem, _MBAR_P_FULL) + K.cast(stage, "uint32") * _u32(8), s_phase ^ _i32(1)
-                )
                 K.ptx.st.shared.b32(
                     _bar(smem, _SMEM_ROW_SUM) + K.cast(state_row, "uint32") * _u32(4), row_sum
                 )
@@ -650,7 +646,7 @@ def _build_kernel():
                     _bar(smem, _SMEM_ROW_MAX) + K.cast(state_row, "uint32") * _u32(4), row_max
                 )
                 K.ptx.fence.proxy.async_.shared__cta()
-                _mbar_arrive(_bar(smem, _MBAR_CORR_SIG) + K.cast(stage, "uint32") * _u32(8))
+                _mbar_arrive(_bar(smem, _MBAR_O_FULL))
                 K.assign(work, work + grid_x)
 
         # ---- elected Q / K / V producer: warp 2 ---------------------------
@@ -935,11 +931,6 @@ def _build_kernel():
 
                 _mbar_wait(_bar(smem, _MBAR_O_FULL), o_phase)
                 _flip(o_phase)
-                K.ptx["tcgen05.fence::after_thread_sync"]()
-                _mbar_wait(_bar(smem, _MBAR_CORR_SIG), corr0_phase)
-                _flip(corr0_phase)
-                _mbar_wait(_bar(smem, _MBAR_CORR_SIG + 8), corr1_phase)
-                _flip(corr1_phase)
                 K.ptx["tcgen05.fence::after_thread_sync"]()
 
                 sum0 = K.local_scalar("float32")
