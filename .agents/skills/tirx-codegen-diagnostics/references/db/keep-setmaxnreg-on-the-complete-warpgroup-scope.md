@@ -54,6 +54,14 @@ This governs where the register instruction sits, not whether the roles are
 worth splitting. Splitting the functional roles is a separate change with its
 own evidence.
 
+Scope validity does not prove the compiler honors the hint. On CUDA 13.2/B200,
+a three-warpgroup probe with only a one-operand launch bound compiled to eight
+registers, warning C7508 and no USETMAXREG. Giving the same body an explicit
+minimum-blocks-per-SM bound of one produced 168 registers and USETMAXREG.
+Do not add an occupancy constraint merely to satisfy a source-level register
+model: it activates a resource contract the original compiled kernel did not
+have, and the same requests can then genuinely overdraw the CTA register pool.
+
 ## Verification
 
 Verify in the realized TIR that there is one producer `setmaxnreg` and that

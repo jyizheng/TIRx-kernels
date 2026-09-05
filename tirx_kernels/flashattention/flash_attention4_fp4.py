@@ -246,12 +246,14 @@ MMA_F16 = "tcgen05.mma.cta_group::1.kind::f16"
 MMA_F8F6F4 = "tcgen05.mma.cta_group::1.kind::f8f6f4"
 NEG_INF = float("-inf")
 L2_SIZE = 50 * 1024 * 1024  # tile_scheduler.py:428
-# instruction descriptors, taken verbatim from the export (`mov.b32 idesc, ...`)
-IDESC_QK_NVFP4 = 0x08201680
+# Packed NVFP4 uses E2M1=1 for both operands, not the unpacked MXF8F6F4
+# encoding E2M1=5. SM103 also requires sparsity-version bit 12 to be zero
+# (PTX ISA 9.4, instruction descriptor Table 53 and its Target ISA Note).
+IDESC_NVFP4 = 0x08200480
+# Other instruction descriptors, taken from the export (`mov.b32 idesc, ...`).
 IDESC_BLOCK32_BASE = 0x08A00000  # | k << 29 | k << 4 (a_sf_id / b_sf_id = k)
 IDESC_PV_BF16 = {128: 0x08210490, 64: 0x08110490}
 IDESC_PV_FP8 = {128: 0x08210010, 64: 0x08110010}
-IDESC_PV_NVFP4 = 0x08201680
 # cuTensorMapEncodeTiled enums
 _TMA_SWIZZLE = {0: 0, 32: 1, 64: 2, 128: 3}
 _TMA_L2_PROMOTION_128B = 2
@@ -801,7 +803,7 @@ def make_kernel(spec: Spec, batch_size, seq_len_q, seq_len_kv, num_qo_heads, num
                                     K.uint32(TMEM_S[stage]),
                                     desc_at(desc_q, a_base + 2 * kt),
                                     desc_at(desc_k, b_base + 2 * kt),
-                                    K.uint32(IDESC_QK_NVFP4),
+                                    K.uint32(IDESC_NVFP4),
                                     K.uint32(TMEM_SFQ[stage] + 4 * kt),
                                     K.uint32(TMEM_SFK[stage] + 4 * kt),
                                     kt != 0,
@@ -853,7 +855,7 @@ def make_kernel(spec: Spec, batch_size, seq_len_q, seq_len_kv, num_qo_heads, num
                                 K.uint32(TMEM_O[stage]),
                                 a_tmem,
                                 b_desc,
-                                K.uint32(IDESC_PV_NVFP4),
+                                K.uint32(IDESC_NVFP4),
                                 K.uint32(TMEM_SFP[stage] + 4 * kt),
                                 K.uint32(TMEM_SFV[stage] + 4 * kt),
                                 enable,
