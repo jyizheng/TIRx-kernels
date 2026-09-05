@@ -529,7 +529,6 @@ def _build_kernel():
         with K.If(K.Or(warp == _i32(0), warp == _i32(4))), K.Then():
             stage = K.local_scalar("int32", init=warp // _i32(4))
             s_phase = K.local_scalar("int32", init=_i32(0))
-            o_phase = K.local_scalar("int32", init=_i32(0))
             p_store_phase = K.local_scalar(
                 "int32", init=K.if_then_else(stage == _i32(0), _i32(1), _i32(0))
             )
@@ -639,10 +638,11 @@ def _build_kernel():
                         _flip(p_store_phase)
                     _mbar_arrive(_bar(smem, _MBAR_P_FULL) + K.cast(stage, "uint32") * _u32(8))
 
-                # Final PV completion acknowledges the last correction signal.
-                # Do not advance CORR_SIG twice before correction observes it.
-                _mbar_wait(_bar(smem, _MBAR_O_FULL), o_phase)
-                _flip(o_phase)
+                # Correction's P_FULL arrival acknowledges the final CORR_SIG.
+                # Reuse the score phase: S_FULL and P_FULL advance once per pair.
+                _mbar_wait(
+                    _bar(smem, _MBAR_P_FULL) + K.cast(stage, "uint32") * _u32(8), s_phase ^ _i32(1)
+                )
                 K.ptx.st.shared.b32(
                     _bar(smem, _SMEM_ROW_SUM) + K.cast(state_row, "uint32") * _u32(4), row_sum
                 )
