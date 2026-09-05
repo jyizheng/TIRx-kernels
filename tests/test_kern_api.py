@@ -124,6 +124,22 @@ def test_sigmoid_tanh_approx_f32_preserves_tanh_input():
     assert float(tanh.args[1]) == 0.25
 
 
+def test_mamba_stochastic_conversion_uses_thor_fallback(monkeypatch):
+    from tirx_kernels.flashinfer.mamba.selective_state_update_mtp_simple import _cvt_rs_f16x2_f32
+
+    for arch in ("sm_100a", "sm_103a", "sm_107a", "sm_110a"):
+        monkeypatch.setenv("TIRX_PREPARE_CUDA_ARCH", arch)
+
+        @K.kernel(warps=1, arch="sm_100a", grid=False)
+        def probe(out: K.gptr("uint32")):
+            result = K.local_scalar("uint32")
+            _cvt_rs_f16x2_f32(result, K.float32(1.0), K.float32(-1.0), K.uint32(0x12340567))
+            K.ptx.st.global_.b32(out.ptr_to([0]), result)
+
+        native = _calls_named(probe.func, "tirx.ptx.cvt_rs_f16x2_f32")
+        assert len(native) == (0 if arch == "sm_110a" else 1), arch
+
+
 def test_mbarrier_arrive_forwards_count_and_predicate():
     @K.kernel(warps=1, arch="sm_100a", grid=False)
     def probe(out: K.gptr("float32")):
