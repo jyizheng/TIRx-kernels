@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 
 import tirx_kernels.kern as K
 import tvm
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, bench
 
 
 def prepare_data(dtype, M, N, K):
@@ -110,7 +111,40 @@ _DEFAULT_CONFIG = {
 }
 
 
+# Thor has fewer SMs and a different cache hierarchy than the datacenter parts.
+# Keep its tile ordering and pipeline choices separate so tuning it does not
+# change the established SM100/SM103/SM107 code paths.
+_THOR_GEMM_CONFIGS = {
+    4096: {
+        "cta_n": 256,
+        "cta_k": 64,
+        "l2_group_size": 4,
+        "overlap_epilogue": True,
+        "pipe_depth": 4,
+        "wb_pipe_depth": 8,
+    },
+    8192: {
+        "cta_n": 256,
+        "cta_k": 64,
+        "l2_group_size": 4,
+        "overlap_epilogue": True,
+        "pipe_depth": 4,
+        "wb_pipe_depth": 8,
+    },
+    16384: {
+        "cta_n": 256,
+        "cta_k": 64,
+        "l2_group_size": 2,
+        "overlap_epilogue": True,
+        "pipe_depth": 4,
+        "wb_pipe_depth": 8,
+    },
+}
+
+
 def _cfg_for(N):
+    if os.environ.get(PREPARE_CUDA_ARCH_ENV) == "sm_110a":
+        return _THOR_GEMM_CONFIGS.get(N, GEMM_CONFIGS.get(N, _DEFAULT_CONFIG))
     return GEMM_CONFIGS.get(N, _DEFAULT_CONFIG)
 
 
