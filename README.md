@@ -20,7 +20,7 @@ keeps them in sync.
 | `sm_100a` | 101 |
 | `sm_103a` | 96 |
 | `sm_107a` | 94 |
-| `sm_110a` | 1 |
+| `sm_110a` | 4 |
 
 ### Native TIRx
 
@@ -109,8 +109,8 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`selective_state_update_stp_simple`](tirx_kernels/flashinfer/mamba/selective_state_update_stp_simple.py),
   [`selective_state_update_stp_vertical`](tirx_kernels/flashinfer/mamba/selective_state_update_stp_vertical.py),
   [`selective_state_update_stp_horizontal`](tirx_kernels/flashinfer/mamba/selective_state_update_stp_horizontal.py),
-  [`selective_state_update_mtp_simple`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_simple.py),
-  [`selective_state_update_mtp_vertical`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_vertical.py),
+  [`selective_state_update_mtp_simple`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_simple.py) ⟨+sm_110a⟩,
+  [`selective_state_update_mtp_vertical`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_vertical.py) ⟨+sm_110a⟩,
   [`selective_state_update_mtp_horizontal`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_horizontal.py)
 - **`flashinfer.kda`:**
   [`flashkda_bf16_fused_m128`](tirx_kernels/flashinfer/kda/bf16_fused_m128.py),
@@ -197,7 +197,7 @@ Grouped by the FlashInfer Python entry point each port backs.
 ### MSA ports
 
 - **Sparse-attention preparation:**
-  [`msa_sparse_prepare_flat_schedule_sm100`](tirx_kernels/msa/sparse_prepare_flat_schedule.py),
+  [`msa_sparse_prepare_flat_schedule_sm100`](tirx_kernels/msa/sparse_prepare_flat_schedule.py) ⟨+sm_110a⟩,
   [`msa_sparse_prepare_fwd_split_atomic_sm100`](tirx_kernels/msa/sparse_prepare_fwd_split_atomic.py)
 - **Sparse-attention forward:**
   [`msa_sparse_atten_fwd_sm100`](tirx_kernels/msa/sparse_atten_fwd.py),

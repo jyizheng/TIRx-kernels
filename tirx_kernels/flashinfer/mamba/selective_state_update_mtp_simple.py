@@ -9,6 +9,7 @@ Upstream source: include/flashinfer/mamba/kernel_selective_state_update_mtp_simp
 """
 
 import functools
+import os
 from typing import Any
 from unittest import SkipTest
 
@@ -19,7 +20,7 @@ import tirx_kernels.kern as K
 KERNEL_META = {
     "name": "selective_state_update_mtp_simple",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -44,6 +45,46 @@ def _align_up(value: int, alignment: int) -> int:
 
 def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
+
+
+def _cvt_rs_f16x2_f32(dst, a, b, random_bits):
+    """Use FlashInfer's integer stochastic-conversion fallback on Thor."""
+    from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV
+
+    if os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") != "sm_110a":
+        K.ptx.cvt.rs.f16x2.f32(dst, a, b, random_bits)
+        return
+
+    def cvt_rs_f16_sw(value, random13):
+        materialized = K.local_scalar("float32", init=value)
+        bits = K.reinterpret("uint32", materialized)
+        sign = K.bitwise_and(bits, K.uint32(0x80000000))
+        abs_bits = K.bitwise_and(bits, K.uint32(0x7FFFFFFF)) + K.bitwise_and(
+            random13, K.uint32(0x1FFF)
+        )
+        f32_exp = K.bitwise_and(K.shift_right(abs_bits, K.uint32(23)), K.uint32(0xFF))
+        f32_mantissa = K.bitwise_and(abs_bits, K.uint32(0x7FFFFF))
+        normal = K.bitwise_or(
+            K.shift_left(f32_exp - K.uint32(112), K.uint32(10)),
+            K.bitwise_and(K.shift_right(abs_bits, K.uint32(13)), K.uint32(0x3FF)),
+        )
+        magnitude = K.if_then_else(
+            f32_exp == K.uint32(0xFF),
+            K.if_then_else(f32_mantissa != K.uint32(0), K.uint32(0x7E00), K.uint32(0x7C00)),
+            K.if_then_else(
+                f32_exp > K.uint32(142),
+                K.uint32(0x7C00),
+                K.if_then_else(f32_exp < K.uint32(113), K.uint32(0), normal),
+            ),
+        )
+        return K.bitwise_or(K.shift_right(sign, K.uint32(16)), magnitude)
+
+    low = cvt_rs_f16_sw(b, K.bitwise_and(random_bits, K.uint32(0x1FFF)))
+    high = cvt_rs_f16_sw(
+        a, K.bitwise_and(K.shift_right(random_bits, K.uint32(16)), K.uint32(0x1FFF))
+    )
+    packed = K.bitwise_or(low, K.shift_left(high, K.uint32(16)))
+    K.ptx.mov.b32(dst, packed)
 
 
 def _shfl_down_f32(value, delta):
@@ -1175,7 +1216,7 @@ def get_kernel(**kwargs: Any):
                                                 K.ptx.mov.b32(random_words[2], c2)
                                                 K.ptx.mov.b32(random_words[3], c3)
                                             packed_f16 = K.local_scalar("uint32")
-                                            K.ptx.cvt.rs.f16x2.f32(
+                                            _cvt_rs_f16x2_f32(
                                                 packed_f16,
                                                 K.cuda.float2_y(state_pair),
                                                 K.cuda.float2_x(state_pair),
@@ -1463,8 +1504,8 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         raise SkipTest("CUDA is required for selective-state-update MTP simple")
     capability = torch.cuda.get_device_capability(device)
-    if capability[0] != 10:
-        raise SkipTest(f"MTP simple SM100 requires compute capability 10.x, got {capability}")
+    if capability[0] != 10 and capability != (11, 0):
+        raise SkipTest(f"MTP simple requires SM100 or Thor, got {capability}")
 
     batch = int(kwargs["batch"])
     nheads = int(kwargs["nheads"])

@@ -85,6 +85,22 @@ def cutedsl_paths() -> list[str]:
     return [str(prefix), str(packages)]
 
 
+def _configure_msa_thor_target() -> None:
+    """Use the Thor spelling recognized by MSA's pinned CuTe-DSL 4.5.3."""
+    from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV
+
+    if os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") != "sm_110a":
+        return
+    if "cutlass" in sys.modules:
+        raise RuntimeError(
+            "MSA Thor target must be configured before importing cutlass; start a fresh worker"
+        )
+    requested = os.environ.get("CUTE_DSL_ARCH")
+    if requested not in (None, "", "sm_110a", "sm_101a"):
+        raise RuntimeError(f"CUTE_DSL_ARCH={requested} conflicts with MSA's Thor target sm_101a")
+    os.environ["CUTE_DSL_ARCH"] = "sm_101a"
+
+
 # The import roots the MSA reference pulls in, and the only ones this recovery
 # is allowed to touch. `tirx_kernels` and `tvm` are excluded above because
 # dropping them mid-process would unload the module doing the dropping.
@@ -199,6 +215,7 @@ def _drop_interrupted_imports() -> None:
 def ensure_msa_importable() -> None:
     """Put MSA's two import roots -- and its pinned CuTe-DSL -- on ``sys.path``."""
     _drop_interrupted_imports()
+    _configure_msa_thor_target()
     if "cutlass" in sys.modules:
         pinned = cutedsl_paths()
         search_path = getattr(sys.modules["cutlass"], "__path__", None)

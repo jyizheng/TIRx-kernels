@@ -530,3 +530,27 @@ Grouped workloads show one row per config and one timing column per implementati
 | `bf16_4096x4096x4096` | tir | 1889.1804 | torch-cublas | 1768.7883 | 0.936 | — |
 | `fp16_1024x1024x1024` | tir | 108.0997 | torch-cublas | 111.0238 | 1.027 | — |
 | `fp16_16384x16384x16384` | tir | 348158.6372 | torch-cublas | 334817.1432 | 0.962 | — |
+
+### msa_sparse_prepare_flat_schedule_sm100
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `decode_b128_k65536_h4` | tirx | 93666.9573 | msa | 119334.1068 | 1.274 | — |
+| `decode_b64_k16384_h4_varlen` | tirx | 3136.1864 | msa | 3995.1724 | 1.274 | — |
+| `prefill_b1_k8192_h2` | tirx | 5.7109 | msa | 6.2449 | 1.094 | — |
+
+### selective_state_update_mtp_simple
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `b1_h64_d64_s128_t6_r8_statebf16_official` | tirx | 24.1904 | flashinfer_cuda | 25.3989 | 1.050 | — |
+| `b2048_h64_d64_s128_t6_r8_statebf16_official` | tirx | 15063.7808 | flashinfer_cuda | 15868.6225 | 1.053 | — |
+| `b512_h64_d64_s128_t6_r8_statebf16_official` | tirx | 3788.1454 | flashinfer_cuda | 3988.6067 | 1.053 | — |
+
+### selective_state_update_mtp_vertical
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `b1_h64_d64_s128_t6_r8_statebf16_official` | tirx | 47.7000 | flashinfer_cuda | 50.0233 | 1.049 | — |
+| `b2048_h64_d64_s128_t6_r8_statebf16_official` | tirx | 25012.4818 | flashinfer_cuda | 26609.4659 | 1.064 | — |
+| `b512_h64_d64_s128_t6_r8_statebf16_official` | tirx | 6220.0814 | flashinfer_cuda | 6629.1134 | 1.066 | — |
