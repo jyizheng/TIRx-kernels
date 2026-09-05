@@ -2,31 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright TIRx authors
 
-"""Check that the README kernel section matches the kernel registry.
+"""Check that each README architecture list matches the kernel registry.
 
-Three things must hold:
-
-* every registered kernel is linked exactly once, and the link opens its module;
-* a kernel restricted to one CUDA architecture carries an inline ``**[sm_xxx]**``
-  tag after its link, and a kernel that runs everywhere carries none;
-* the architecture overview table lists the correct kernel count and the exact
-  set of single-architecture kernels for each architecture.
-
-``KERNEL_META["runtime_cuda_archs"]`` is the authority for all three.
+Every supported CUDA architecture has its own section. Each section must list
+exactly the public kernels whose ``KERNEL_META["runtime_cuda_archs"]`` contains
+that architecture, and every link must open the registered module.
 """
 
 from __future__ import annotations
 
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 README = REPO_ROOT / "README.md"
-ALL_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
+ARCHITECTURES = ("sm_110a", "sm_100a", "sm_103a", "sm_107a")
 
-_LINK = re.compile(r"\[`([^`]+)`\]\((tirx_kernels/[^)]+\.py)\)( \*\*\[(sm_[0-9]+[af]?)\]\*\*)?")
-_TABLE_ROW = re.compile(r"^\| `(sm_[0-9]+[af]?)`[^|]*\| (\d+) \|([^|]*)\|$", re.MULTILINE)
+_ARCH_HEADING = re.compile(r"^### `(sm_[0-9]+[af]?)` \([^)]+\)$", re.MULTILINE)
+_LINK = re.compile(r"^- \[`([^`]+)`\]\((tirx_kernels/[^)]+\.py)\)$", re.MULTILINE)
 
 
 def _registry() -> dict[str, tuple[str, tuple[str, ...]]]:
@@ -47,43 +42,48 @@ def main() -> int:
     text = README.read_text()
     errors: list[str] = []
 
-    linked: dict[str, tuple[str, str | None]] = {}
-    for name, path, _, tag in _LINK.findall(text):
-        if name in linked:
-            errors.append(f"{name}: linked more than once")
-        linked[name] = (path, tag or None)
+    _, kernel_marker, remainder = text.partition("## Kernels\n")
+    kernel_text, performance_marker, _ = remainder.partition("\n## Performance")
+    if not kernel_marker or not performance_marker:
+        errors.append("README.md must contain Kernels and Performance sections")
+        headings = []
+    else:
+        headings = list(_ARCH_HEADING.finditer(kernel_text))
 
-    for name, (path, archs) in sorted(kernels.items()):
-        if name not in linked:
-            errors.append(f"{name}: not linked in README.md")
-            continue
-        readme_path, tag = linked[name]
-        if readme_path != path:
-            errors.append(f"{name}: README links {readme_path}, module is {path}")
-        expected_tag = None if archs == ALL_ARCHS else archs[0] if len(archs) == 1 else None
-        if archs != ALL_ARCHS and len(archs) != 1:
-            errors.append(f"{name}: runtime_cuda_archs {archs} needs a README convention")
-        elif tag != expected_tag:
-            errors.append(
-                f"{name}: README tag is {tag}, runtime_cuda_archs {archs} needs {expected_tag}"
-            )
-    for name in sorted(set(linked) - set(kernels)):
-        errors.append(f"{name}: linked in README.md but not registered")
+    listed_archs = tuple(match.group(1) for match in headings)
+    if listed_archs != ARCHITECTURES:
+        errors.append(f"architecture sections must be {ARCHITECTURES}, found {listed_archs}")
 
-    table = {
-        arch: (int(count), set(re.findall(r"`([^`]+)`", names)))
-        for arch, count, names in _TABLE_ROW.findall(text)
-    }
-    for arch in ALL_ARCHS:
-        count = sum(arch in archs for _, archs in kernels.values())
-        only = {name for name, (_, archs) in kernels.items() if archs == (arch,)}
-        if arch not in table:
-            errors.append(f"overview table: missing row for {arch}")
-        elif table[arch] != (count, only):
-            errors.append(
-                f"overview table: {arch} row should list {count} kernels and "
-                f"{sorted(only)}, found {table[arch][0]} and {sorted(table[arch][1])}"
-            )
+    registry_archs = {arch for _, archs in kernels.values() for arch in archs}
+    for arch in sorted(registry_archs - set(ARCHITECTURES)):
+        errors.append(f"registry architecture {arch} has no README section")
+
+    parsed_link_count = 0
+    for index, heading in enumerate(headings):
+        arch = heading.group(1)
+        body_end = headings[index + 1].start() if index + 1 < len(headings) else len(kernel_text)
+        body = kernel_text[heading.end() : body_end]
+        links = _LINK.findall(body)
+        parsed_link_count += len(links)
+
+        counts = Counter(name for name, _ in links)
+        for name, count in sorted(counts.items()):
+            if count > 1:
+                errors.append(f"{arch}: {name} is linked {count} times")
+
+        found = dict(links)
+        expected = {name: path for name, (path, archs) in kernels.items() if arch in archs}
+        for name in sorted(set(expected) - set(found)):
+            errors.append(f"{arch}: {name} is not linked")
+        for name in sorted(set(found) - set(expected)):
+            errors.append(f"{arch}: {name} is linked but not supported")
+        for name in sorted(set(expected) & set(found)):
+            if found[name] != expected[name]:
+                errors.append(f"{arch}: {name} links {found[name]}, module is {expected[name]}")
+
+    all_kernel_links = re.findall(r"\[`[^`]+`\]\(tirx_kernels/[^)]+\.py\)", kernel_text)
+    if len(all_kernel_links) != parsed_link_count:
+        errors.append("kernel links must be plain bullets inside architecture sections")
 
     for error in errors:
         print(error, file=sys.stderr)

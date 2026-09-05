@@ -650,7 +650,7 @@ def make_kernel(dtype: str, M: int, N: int, Kdim: int):
 KERNEL_META = {
     "name": "fp16_bf16_gemm",
     "category": "basic",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
 }
 CONFIGS = [
     {"dtype": d, "M": s, "N": s, "K": s, "label": f"{d}_{s}x{s}x{s}"}
@@ -703,7 +703,8 @@ def run_gpu(prepared: PreparedBench, *, warmup=None, repeat=None, timer=None, **
         return lambda: torch.matmul(A, B.T, out=C_out)
 
     references = {"torch-cublas": _torch_cublas}
-    if prepared.dtype == "bf16":
+    # DeepGEMM's BF16 references reject Thor; cuBLAS supports the device.
+    if prepared.dtype == "bf16" and torch.cuda.get_device_capability() != (11, 0):
 
         def _deepgemm_cublaslt():
             import deep_gemm
