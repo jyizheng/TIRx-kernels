@@ -185,7 +185,8 @@ def _descriptor_with_address(base, shared_address):
 
 
 def _instruction_descriptor():
-    value = (1 << 3) | (1 << 7) | (1 << 10)
+    # PTX FP4 descriptor: K128 and SM107 sparsity-version v1 (also for dense MMA).
+    value = (1 << 3) | (1 << 7) | (1 << 10) | (1 << 12)
     value |= ((128 >> 3) & 0x3F) << 17
     value |= (0 & 3) << 23
     value |= ((128 >> 4) & 0x1F) << 24
@@ -567,6 +568,9 @@ def _make_kernel(num_experts, seq_len, N, K_dim, routing, num_sms, use_pdl):
                 count = K.local_scalar("int32", init=0)
                 with K.While(count < k_tiles):
                     _wait(a_pipe.empty.ptr_to([producer.stage]), producer.phase)
+                    # The prior MMA reads A through the async proxy; cp.async
+                    # reuses it through the generic proxy after this handoff.
+                    K.ptx.fence.proxy.async_.shared__cta()
                     if materialize_gather_a:
                         count_uniform = K.uniform(count)
                         k_offset = K.local_scalar("uint64")
@@ -786,6 +790,8 @@ def _make_kernel(num_experts, seq_len, N, K_dim, routing, num_sms, use_pdl):
                 accumulate = K.local_scalar("uint32", init=K.uint32(0))
                 with K.While(count < k_tiles):
                     _wait(a_pipe.full.ptr_to([a_consumer.stage]), a_consumer.phase)
+                    # cp.async (not bulk) writes through the generic proxy.
+                    K.ptx.fence.proxy.async_.shared__cta()
                     _wait(b_pipe.full.ptr_to([b_consumer.stage]), b_consumer.phase)
                     _wait(sfa_t_pipe.full.ptr_to([sfa_t_consumer.stage]), sfa_t_consumer.phase)
                     for chunk in range(4):
