@@ -520,3 +520,13 @@ Grouped workloads show one row per config and one timing column per implementati
 - `stable_sort_topk_by_value/f32_r4_k128`: prepare: RuntimeError: CPU prepare changed CUDA initialization state from False to True
 - `stable_sort_topk_by_value/f32_r64_k2048`: prepare: RuntimeError: CPU prepare changed CUDA initialization state from False to True
 - `stable_sort_topk_by_value/f32_r64_k256`: prepare: RuntimeError: CPU prepare changed CUDA initialization state from False to True
+
+## Jetson AGX Thor (`sm_110a`)
+
+### fp16_bf16_gemm
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `bf16_4096x4096x4096` | tir | 1889.1804 | torch-cublas | 1768.7883 | 0.936 | — |
+| `fp16_1024x1024x1024` | tir | 108.0997 | torch-cublas | 111.0238 | 1.027 | — |
+| `fp16_16384x16384x16384` | tir | 348158.6372 | torch-cublas | 334817.1432 | 0.962 | — |
