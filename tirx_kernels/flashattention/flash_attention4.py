@@ -26,7 +26,7 @@ import torch
 import tirx_kernels.kern as K
 import tvm
 import tvm.testing
-from tirx_kernels.runner import bench, cuda_target
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, PREPARE_NUM_SMS_ENV, bench, cuda_target
 from tvm.tirx.cuda import iket
 from tvm.tirx.cuda.iket import IketProfiler
 
@@ -67,7 +67,6 @@ EMU_PAIRS_CAUSAL = 2
 EMU_START_CAUSAL = 0
 EMU_PAIRS_NC = 2
 EMU_START_NC = 1
-CTA_GROUP = 1
 MAX_CTAS = 148
 
 TMA_G2S_3D = (
@@ -111,7 +110,14 @@ def make_kernel(
     original is a plain Python constant here — the host language is the macro
     system (design doc §1)."""
     TMEM_DEPTH = tmem_pipe_depth
-    KV_DEPTH = smem_pipe_depth_kv
+    IS_THOR = os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") == "sm_110a"
+    USE_2CTA = IS_THOR and not is_causal
+    cta_group = 2 if USE_2CTA else 1
+    # A 2-CTA MMA distributes each operand's K dimension across the pair. Each
+    # CTA stores a 64-wide slice, so the same shared-memory budget holds twice
+    # as many K/V stages.
+    KV_DEPTH = smem_pipe_depth_kv * cta_group
+    KV_ROWS = BLK_N // cta_group
 
     GQA_RATIO = NUM_QO_HEADS // NUM_KV_HEADS
     SEQ_Q_PER_TILE = BLK_M // GQA_RATIO
@@ -125,14 +131,22 @@ def make_kernel(
     SSCALE_TOTAL_SIZE = 2 * SMEM_PIPE_DEPTH_Q * BLK_M
     assert TMEM_DEPTH * MMA_N <= N_COLS_TMEM, "TMEM columns exceeded"
     num_q_blocks_total = ceildiv(SEQ_LEN_Q, SEQ_Q_PER_TILE)
-    num_q_blocks = ceildiv(num_q_blocks_total, SMEM_PIPE_DEPTH_Q)
+    num_q_blocks = ceildiv(num_q_blocks_total, SMEM_PIPE_DEPTH_Q * cta_group)
     num_total_tasks = BATCH_SIZE * NUM_KV_HEADS * num_q_blocks
     num_kv_blocks = ceildiv(SEQ_LEN_KV, BLK_N)
     # orig:L601-620.
     EPI_ON_SOFTMAX = is_causal
     EARLY_Q_RELEASE = not is_causal
-    cta_count = num_total_tasks if is_causal else min(MAX_CTAS, num_total_tasks)
+    if USE_2CTA:
+        max_ctas = int(os.environ.get(PREPARE_NUM_SMS_ENV, "20"))
+        cta_count = min(max_ctas, num_total_tasks * cta_group)
+        cta_count -= cta_count % cta_group
+    else:
+        max_ctas = 6 * int(os.environ.get(PREPARE_NUM_SMS_ENV, "20")) if IS_THOR else MAX_CTAS
+        cta_count = num_total_tasks if is_causal else min(max_ctas, num_total_tasks)
+    scheduler_ctas = cta_count // cta_group
     # PV gemm split point, regime-tuned — orig:L922-930.
+    thor_causal_d128 = IS_THOR and is_causal and HEAD_DIM == 128
     K_SPLIT = (4 if is_causal else 6) * MMA_K
     P_SPLIT_Q = 2 if is_causal else 3
     ACC_SCALE_BASE = 0
@@ -141,6 +155,32 @@ def make_kernel(
     rescale_threshold = 8.0
     STEADY_DESC = is_causal and GQA_RATIO > 1
     NEG_INF = -float("inf")
+    tma_g2s_3d = (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2"
+        if USE_2CTA
+        else TMA_G2S_3D
+    )
+    tma_g2s_4d = (
+        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2"
+        if USE_2CTA
+        else TMA_G2S_4D
+    )
+    mma_f16 = "tcgen05.mma.cta_group::2.kind::f16" if USE_2CTA else MMA_F16
+    mma_keep_lanes = (K.uint32(0),) * (8 if USE_2CTA else 4)
+    id_qk = 270532624 if USE_2CTA else ID_QK
+    id_pv = 270598160 if USE_2CTA else ID_PV
+    tmem_alloc = (
+        "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32" if USE_2CTA else TMEM_ALLOC
+    )
+    tmem_dealloc = "tcgen05.dealloc.cta_group::2.sync.aligned.b32" if USE_2CTA else TMEM_DEALLOC
+    tmem_relinquish = (
+        "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned" if USE_2CTA else TMEM_RELINQUISH
+    )
+    tcgen05_commit = (
+        "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+        if USE_2CTA
+        else TCGEN05_COMMIT
+    )
 
     # ---- trace-time helpers over the causal block bounds — orig:L138-152 ----
 
@@ -168,6 +208,8 @@ def make_kernel(
         O_tensor_map: K.TensorMap,
     ):
         # ---- CTA coordinates — orig:L625-628 ---------------------------------
+        cta_rank = K.cta_id_in_cluster([2], preferred=[2]) if USE_2CTA else K.int32(0)
+        cluster_id = K.cta_id() // cta_group
         # Materialize the warp-uniform ids once; TIRx expressions are trees and
         # rebuilding these at every use expands address and mask arithmetic.
         warp_cta = K.warp_id()
@@ -184,11 +226,18 @@ def make_kernel(
         # pool.alloc_tcgen05_mma_AB(..., "float16") picks ("auto" -> 128B atom):
         # both call mma_shared_layout(dtype, SWIZZLE_128B_ATOM, shape) with
         # align=1024.
-        q_smem = smem.alloc((SMEM_PIPE_DEPTH_Q, BLK_M, HEAD_DIM), K.f16, swizzle=K.SW128B)
+        q_smem = smem.alloc(
+            (SMEM_PIPE_DEPTH_Q, BLK_M * cta_group, HEAD_DIM // cta_group), K.f16, swizzle=K.SW128B
+        )
         # K and V share one ring: the loader alternates load_k / load_v into
-        # successive stages, so the original allocates K_smem once and takes
-        # V_smem as a view of it (orig:L631-632). One allocation, two roles.
-        kv_smem = smem.alloc((KV_DEPTH, BLK_N, HEAD_DIM), K.f16, swizzle=K.SW128B)
+        # successive stages. In the 2-CTA schedule K and V are [128, 64] per
+        # CTA, with V consumed through the transposed descriptor view.
+        # The backing allocation remains 96KB in both schedules.
+        kv_base = SMEM_PIPE_DEPTH_Q * BLK_M * HEAD_DIM * F16_BYTES
+        k_smem = smem.alloc((KV_DEPTH, BLK_N, HEAD_DIM // cta_group), K.f16, swizzle=K.SW128B)
+        smem.pool.move_base_to(kv_base)
+        v_smem = smem.alloc((KV_DEPTH, BLK_N, HEAD_DIM // cta_group), K.f16, swizzle=K.SW128B)
+        smem.pool.move_base_to(kv_base + KV_DEPTH * KV_ROWS * HEAD_DIM * F16_BYTES)
         o_smem = smem.alloc((TMEM_DEPTH, BLK_M, HEAD_DIM), K.f16, swizzle=K.SW128B)
 
         # 16-byte units between two ring stages of a swizzled tile: a stage is a
@@ -197,7 +246,8 @@ def make_kernel(
             return tile.rows * tile.cols * tile.bits // 8 // 16
 
         Q_STAGE16 = stage16(q_smem)
-        KV_STAGE16 = stage16(kv_smem)
+        KV_STAGE16 = stage16(k_smem)
+        assert KV_STAGE16 == stage16(v_smem)
 
         # How a descriptor is carried from its encode to the tcgen05.mma
         # operands, by regime. SPLIT_DESC keeps the two halves in plain C
@@ -266,7 +316,7 @@ def make_kernel(
             )
             return packed[0]
 
-        def encode(view, major="k"):
+        def encode(view, major="k", operand=None):
             """One hoisted, lo-uniform tcgen05 matrix descriptor for a stage-0 view.
 
             Returns ``(halves, off16)``. K derives ldo/sdo/swizzle from the tile it
@@ -283,6 +333,41 @@ def make_kernel(
             ``off16`` walks. So all seven encodes below are the same instruction
             the original emits.
             """
+            if USE_2CTA:
+                # Each CTA holds one 64-wide slice of the group MMA operand.
+                # All three upstream descriptors encode LBO=512/SBO=64, while
+                # their K walks differ: Q crosses the second 128-row slab, K
+                # crosses the second 64-row slab, and V walks 16 rows at a
+                # time along its MN-major axis.
+                desc_value = K.alloc_local((1,), "uint64")
+                K.cuda.tcgen05.encode_matrix_descriptor(
+                    K.address_of(desc_value[0]),
+                    view.ptr_to(0, 0),
+                    ldo=512,
+                    sdo=64,
+                    swizzle=K.SW128B.value,
+                )
+                desc_lo = K.alloc_local((1,), "uint32")
+                desc_hi = K.alloc_local((1,), "uint32")
+                K.assign(desc_lo[0], K.uniform(K.Cast("uint32", desc_value[0])))
+                K.assign(desc_hi[0], K.Cast("uint32", K.shift_right(desc_value[0], K.uint64(32))))
+
+                if operand == "q":
+
+                    def off16(kp):
+                        return (kp % 4) * 2 + (kp // 4) * 1024
+
+                elif operand == "k":
+
+                    def off16(kp):
+                        return (kp % 4) * 2 + (kp // 4) * 512
+
+                else:
+
+                    def off16(kp):
+                        return kp * 128
+
+                return (desc_lo, desc_hi), off16
             desc, off16 = view.encode(major=major, mma_k=MMA_K)
             return lo_uniform(desc), off16
 
@@ -290,15 +375,15 @@ def make_kernel(
         # alias); they are separate registers on purpose, and the five *_steady
         # / *_tail copies exist to shorten descriptor live ranges on the causal
         # GQA>1 path (orig's own comment at get_flash_attention4_kernel).
-        q_desc, koff = encode(q_smem[0])
-        k_desc, _ = encode(kv_smem[0])
-        v_desc, mnoff = encode(kv_smem[0], major="mn")
+        q_desc, qoff = encode(q_smem[0], operand="q")
+        k_desc, koff = encode(k_smem[0], operand="k")
+        v_desc, mnoff = encode(v_smem[0], major="mn", operand="v")
         if STEADY_DESC:
-            q_desc_steady, _ = encode(q_smem[0])
-            k_desc_steady, _ = encode(kv_smem[0])
-            v_desc_steady_hi, _ = encode(kv_smem[0], major="mn")
-            v_desc_tail_lo, _ = encode(kv_smem[0], major="mn")
-            v_desc_tail_hi, _ = encode(kv_smem[0], major="mn")
+            q_desc_steady, _ = encode(q_smem[0], operand="q")
+            k_desc_steady, _ = encode(k_smem[0], operand="k")
+            v_desc_steady_hi, _ = encode(v_smem[0], major="mn", operand="v")
+            v_desc_tail_lo, _ = encode(v_smem[0], major="mn", operand="v")
+            v_desc_tail_hi, _ = encode(v_smem[0], major="mn", operand="v")
         else:
             q_desc_steady = q_desc
             k_desc_steady = k_desc
@@ -325,7 +410,7 @@ def make_kernel(
         )
         kv_load = K.Pipeline(smem, KV_DEPTH, full="tma", empty="tcgen05", empty_phase_offset=1)
         p_o_rescale = K.MBarrier(smem, 2)
-        p_o_rescale.init(256)
+        p_o_rescale.init(256 * cta_group)
         # s_ready / o_ready are one-way tcgen05 signals: no slot is recycled, so
         # they are bare barriers rather than Pipelines. The producing side is
         # the matrix engine, so its arrive IS `tcgen05.commit` -- spelled as the
@@ -348,15 +433,23 @@ def make_kernel(
             empty_phase_offset=1,
         )
         p_ready_2 = K.MBarrier(smem, 2)
-        p_ready_2.init(128)
+        p_ready_2.init(128 * cta_group)
         # Initialized in the FIRST init group so the single prologue fence
         # covers it, even though USE_S0_S1_BARRIER is off — orig:L692-696.
         bar_s0_s1_sequence = K.MBarrier(smem, 8)
         bar_s0_s1_sequence.init(32)
 
+        q_load_full_remote = q_load.full.remote_view(0) if USE_2CTA else q_load.full
+        kv_load_full_remote = kv_load.full.remote_view(0) if USE_2CTA else kv_load.full
+        p_o_rescale_remote = p_o_rescale.remote_view(0) if USE_2CTA else p_o_rescale
+        p_ready_2_remote = p_ready_2.remote_view(0) if USE_2CTA else p_ready_2
+
         K.ptx.fence.proxy.async_.shared__cta()
         K.ptx.fence.mbarrier_init.release.cluster()
-        K.cuda.cta_sync()
+        if USE_2CTA:
+            K.cuda.cluster_sync()
+        else:
+            K.cuda.cta_sync()
 
         # ---- shared closures -------------------------------------------------
 
@@ -365,7 +458,10 @@ def make_kernel(
 
         def commit(bar, stage):
             """The matrix engine's arrive on a one-way barrier — orig TCGen05Bar.arrive."""
-            K.ptx[TCGEN05_COMMIT](bar.ptr_to([stage]))
+            if USE_2CTA:
+                K.ptx[tcgen05_commit](bar.ptr_to([stage]), K.Cast("uint16", K.uint32(3)))
+            else:
+                K.ptx[tcgen05_commit](bar.ptr_to([stage]))
 
         def tmem(col):
             """A tmem address. The kernel asserts its allocation base is 0 (below)
@@ -521,15 +617,16 @@ def make_kernel(
             K.ptx.mov.b32(out[idx + 1], combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1]))
 
         # ---- roles — orig:L752/765/1060/1396 ---------------------------------
-        # The frozen kernel's register budget is exactly the 65536-register CTA
-        # file: 200*32*8 + 64*32*4 + 48*32*4 = 65536. K checks that, plus the
-        # exact partition of warps 0..15 and setmaxnreg warpgroup-uniformity;
-        # the original satisfies all three, verified nowhere.
+        # Both role splits consume the complete 65536-register CTA file. The
+        # pinned upstream FA4 schedule uses 192/72/56 for causal D128 on SM110.
+        softmax_regs = 192 if thor_causal_d128 else 200
+        correction_regs = 72 if thor_causal_d128 else 64
+        other_regs = 56 if thor_causal_d128 else 48
         sp = K.specialize(chain_dispatch=True)
-        r_softmax = sp.role("softmax", warps=[0, 1, 2, 3, 4, 5, 6, 7], regs=200)
-        r_correction = sp.role("correction", warps=[8, 9, 10, 11], regs=64)
-        wg3 = sp.warpgroup("wg3", warps=range(12, 16), regs=48)
-        r_mma = sp.role("mma", warps=[12], group=wg3)
+        r_softmax = sp.role("softmax", warps=[0, 1, 2, 3, 4, 5, 6, 7], regs=softmax_regs)
+        r_correction = sp.role("correction", warps=[8, 9, 10, 11], regs=correction_regs)
+        wg3 = sp.warpgroup("wg3", warps=range(12, 16), regs=other_regs)
+        r_mma = sp.role("mma", warps=[12], group=wg3, when=cta_rank == 0 if USE_2CTA else None)
         r_load = sp.role("load", warps=[13], group=wg3)
         r_store = sp.role("store", warps=[14], group=wg3)
         r_idle = sp.role("idle", warps=[15], group=wg3)
@@ -549,10 +646,10 @@ def make_kernel(
                 num_batches=BATCH_SIZE,
                 num_heads=NUM_KV_HEADS,
                 num_m_blocks=num_q_blocks,
-                num_ctas=cta_count,
+                num_ctas=scheduler_ctas,
             )
         )
-        scheduler.init(K.cta_id())
+        scheduler.init(cluster_id)
         # TMEM is allocated by the MMA warp and deliberately sits AFTER the
         # prologue cta_sync: every other warp's first TMEM access is
         # transitively gated behind this warp — orig:L698-751. These three
@@ -560,7 +657,7 @@ def make_kernel(
         # once, outside the task loop, while the role blocks (and their
         # setmaxnreg) are inside it.
         with K.If(warp_cta == 12), K.Then():
-            K.ptx[TMEM_ALLOC](K.address_of(tmem_addr[0]), K.uint32(N_COLS_TMEM))
+            K.ptx[tmem_alloc](K.address_of(tmem_addr[0]), K.uint32(N_COLS_TMEM))
             K.cuda.warp_sync()
         with K.If(tvm.tirx.all(wg_id == 3, warp_id == 0)), K.Then():
             allocated = K.local_scalar("uint32")
@@ -568,7 +665,7 @@ def make_kernel(
             K.cuda.trap_when_assert_failed(allocated == K.uint32(0))
         with K.If(wg_id == 2), K.Then():
             for i_q in range(2):
-                p_o_rescale.arrive(i_q)
+                p_o_rescale_remote.arrive(i_q)
 
         # =====================================================================
         # Roles stay inside the task loop, preserving per-task setmaxnreg.
@@ -577,7 +674,11 @@ def make_kernel(
             m_block_idx = scheduler.m_block_idx
             batch_idx = scheduler.batch_idx
             kv_head_idx = scheduler.head_idx
-            m_start = m_block_idx * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
+
+            def q_tile_start(i_q):
+                return (
+                    m_block_idx * SMEM_PIPE_DEPTH_Q * cta_group + i_q * cta_group + cta_rank
+                ) * SEQ_Q_PER_TILE
 
             # =================================================================
             # wg3 — sibling TMA-load, TMA-store, MMA, and idle roles.
@@ -593,48 +694,93 @@ def make_kernel(
                         q_load.empty.wait(i_q, q_epoch.phase)
                         tma_q_token = iket_range("issue-tma-q")
                         with K.If(elected()), K.Then():
-                            if GQA_RATIO == 1:
-                                K.ptx[TMA_G2S_3D](
-                                    q_smem[i_q].ptr_to(0, 0),
-                                    K.address_of(tensor_map),
-                                    K.int32(0),
-                                    K.Cast("int32", m_start + i_q * SEQ_Q_PER_TILE),
-                                    K.Cast("int32", (batch_idx * NUM_QO_HEADS + kv_head_idx) * 2),
-                                    K.cuda.cvta_generic_to_shared(q_load.full.ptr_to([i_q])),
-                                )
+                            for k_part in range(cta_group):
+                                if GQA_RATIO == 1:
+                                    K.ptx[tma_g2s_3d](
+                                        q_smem[i_q].ptr_to(k_part * BLK_M, 0),
+                                        K.address_of(tensor_map),
+                                        K.int32(0),
+                                        K.Cast("int32", q_tile_start(i_q)),
+                                        K.Cast(
+                                            "int32",
+                                            (batch_idx * NUM_QO_HEADS + kv_head_idx) * 2
+                                            + (k_part if USE_2CTA else 0),
+                                        ),
+                                        K.cuda.cvta_generic_to_shared(
+                                            q_load_full_remote.ptr_to([i_q])
+                                        ),
+                                    )
+                                else:
+                                    K.ptx[tma_g2s_4d](
+                                        q_smem[i_q].ptr_to(k_part * BLK_M, 0),
+                                        K.address_of(tensor_map),
+                                        K.int32(0),
+                                        K.Cast("int32", kv_head_idx * GQA_RATIO),
+                                        K.Cast("int32", q_tile_start(i_q)),
+                                        K.Cast(
+                                            "int32", batch_idx * 2 + (k_part if USE_2CTA else 0)
+                                        ),
+                                        K.cuda.cvta_generic_to_shared(
+                                            q_load_full_remote.ptr_to([i_q])
+                                        ),
+                                    )
+                            if USE_2CTA:
+                                with K.If(cta_rank == 0), K.Then():
+                                    q_load_full_remote.arrive(
+                                        i_q, tx_count=cta_group * BLK_M * HEAD_DIM * F16_BYTES
+                                    )
                             else:
-                                K.ptx[TMA_G2S_4D](
-                                    q_smem[i_q].ptr_to(0, 0),
-                                    K.address_of(tensor_map),
-                                    K.int32(0),
-                                    K.Cast("int32", kv_head_idx * GQA_RATIO),
-                                    K.Cast("int32", m_start + i_q * SEQ_Q_PER_TILE),
-                                    K.Cast("int32", batch_idx * 2),
-                                    K.cuda.cvta_generic_to_shared(q_load.full.ptr_to([i_q])),
+                                q_load_full_remote.arrive(
+                                    i_q, tx_count=cta_group * BLK_M * HEAD_DIM * F16_BYTES
                                 )
-                            q_load.full.arrive(
-                                i_q, tx_count=CTA_GROUP * BLK_M * HEAD_DIM * F16_BYTES
-                            )
                         K.cuda.iket.range_end(tma_q_token[0])
 
-                    def load_kv(i_kv, tensor_map, event):
+                    def load_kv(i_kv, tensor_map, event, is_v=False):
                         """One K or V box into the shared KV ring — orig:L800-840.
                         The two loads are the same instruction on the same ring;
                         only the tensormap differs."""
                         kv_load.empty.wait(kv_pipe.stage, kv_pipe.phase)
                         tma_kv_token = iket_range(event)
                         with K.If(elected()), K.Then():
-                            K.ptx[TMA_G2S_3D](
-                                kv_smem[kv_pipe.stage].ptr_to(0, 0),
-                                K.address_of(tensor_map),
-                                K.int32(0),
-                                K.Cast("int32", i_kv * BLK_N),
-                                K.Cast("int32", (batch_idx * NUM_KV_HEADS + kv_head_idx) * 2),
-                                K.cuda.cvta_generic_to_shared(kv_load.full.ptr_to([kv_pipe.stage])),
-                            )
-                            kv_load.full.arrive(
-                                kv_pipe.stage, tx_count=CTA_GROUP * BLK_N * HEAD_DIM * F16_BYTES
-                            )
+                            for k_part in range(1 if is_v else cta_group):
+                                K.ptx[tma_g2s_3d](
+                                    (v_smem if is_v else k_smem)[kv_pipe.stage].ptr_to(
+                                        0 if is_v else k_part * KV_ROWS, 0
+                                    ),
+                                    K.address_of(tensor_map),
+                                    K.int32(0),
+                                    K.Cast(
+                                        "int32",
+                                        i_kv * BLK_N + cta_rank * KV_ROWS
+                                        if not is_v
+                                        else i_kv * BLK_N,
+                                    ),
+                                    K.Cast(
+                                        "int32",
+                                        (batch_idx * NUM_KV_HEADS + kv_head_idx) * 2
+                                        + (
+                                            cta_rank
+                                            if is_v and USE_2CTA
+                                            else k_part
+                                            if USE_2CTA
+                                            else 0
+                                        ),
+                                    ),
+                                    K.cuda.cvta_generic_to_shared(
+                                        kv_load_full_remote.ptr_to([kv_pipe.stage])
+                                    ),
+                                )
+                            if USE_2CTA:
+                                with K.If(cta_rank == 0), K.Then():
+                                    kv_load_full_remote.arrive(
+                                        kv_pipe.stage,
+                                        tx_count=cta_group * KV_ROWS * HEAD_DIM * F16_BYTES,
+                                    )
+                            else:
+                                kv_load_full_remote.arrive(
+                                    kv_pipe.stage,
+                                    tx_count=cta_group * KV_ROWS * HEAD_DIM * F16_BYTES,
+                                )
                         K.cuda.iket.range_end(tma_kv_token[0])
                         kv_pipe.advance()
 
@@ -646,11 +792,11 @@ def make_kernel(
                     load_kv(load_trip_count - 1, K_tensor_map, "issue-tma-k")
                     load_q(1, Q_tensor_map_1)
                     q_epoch.advance()
-                    load_kv(load_trip_count - 1, V_tensor_map, "issue-tma-v")
+                    load_kv(load_trip_count - 1, V_tensor_map, "issue-tma-v", is_v=True)
                     with K.serial(load_trip_count - 1, unroll=False) as _i:
                         i_kv = load_trip_count - 2 - _i
                         load_kv(i_kv, K_tensor_map_1, "issue-tma-k")
-                        load_kv(i_kv, V_tensor_map_1, "issue-tma-v")
+                        load_kv(i_kv, V_tensor_map_1, "issue-tma-v", is_v=True)
 
                 # -------- warp 2: O store — orig:L857-895 ------------------------
                 with r_store:
@@ -659,7 +805,7 @@ def make_kernel(
                     for i_q in range(SMEM_PIPE_DEPTH_Q):
                         if i_q != 0:
                             corr_epi.full.wait(i_q, tmem_epoch.phase)
-                        m_start_global = m_start + i_q * SEQ_Q_PER_TILE
+                        m_start_global = q_tile_start(i_q)
                         with K.If(elected()), K.Then():
                             if GQA_RATIO == 1:
                                 K.ptx[TMA_S2G_3D](
@@ -702,15 +848,12 @@ def make_kernel(
                         kernel's hand-written constant to the bit."""
                         for ki in range(HEAD_DIM // MMA_K):
                             with K.If(elected()), K.Then():
-                                K.ptx[MMA_F16](
+                                K.ptx[mma_f16](
                                     K.Cast("uint32", q_stage * MMA_N),
-                                    desc_at(qd, q_stage * Q_STAGE16 + koff(ki)),
+                                    desc_at(qd, q_stage * Q_STAGE16 + qoff(ki)),
                                     desc_at(kd, kv_stage * KV_STAGE16 + koff(ki)),
-                                    K.uint32(ID_QK),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
+                                    K.uint32(id_qk),
+                                    *mma_keep_lanes,
                                     ki != 0,
                                 )
                         with K.If(elected()), K.Then():
@@ -722,15 +865,12 @@ def make_kernel(
                         rows: 16 rows = 128 16B units."""
                         for ki in range(K_SPLIT // MMA_K):
                             with K.If(elected()), K.Then():
-                                K.ptx[MMA_F16](
+                                K.ptx[mma_f16](
                                     K.Cast("uint32", (SMEM_PIPE_DEPTH_Q + i_q) * MMA_N),
                                     K.Cast("uint32", i_q * MMA_N + MMA_N // 2 + ki * (MMA_K // 2)),
                                     desc_at(vd, kv_stage * KV_STAGE16 + mnoff(ki)),
-                                    K.uint32(ID_PV),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
+                                    K.uint32(id_pv),
+                                    *mma_keep_lanes,
                                     # any(ki != 0, should_accumulate), folded at
                                     # trace time: ki is a Python int here.
                                     True if ki != 0 else K.Cast("bool", should_accumulate),
@@ -741,7 +881,7 @@ def make_kernel(
                         p_ready_2.wait(i_q, tmem_epoch.phase)
                         for ki in range((BLK_N - K_SPLIT) // MMA_K):
                             with K.If(elected()), K.Then():
-                                K.ptx[MMA_F16](
+                                K.ptx[mma_f16](
                                     K.Cast("uint32", (SMEM_PIPE_DEPTH_Q + i_q) * MMA_N),
                                     K.Cast(
                                         "uint32",
@@ -750,11 +890,8 @@ def make_kernel(
                                     desc_at(
                                         vd, kv_stage * KV_STAGE16 + mnoff(K_SPLIT // MMA_K + ki)
                                     ),
-                                    K.uint32(ID_PV),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
-                                    K.uint32(0),
+                                    K.uint32(id_pv),
+                                    *mma_keep_lanes,
                                     True,
                                 )
 
@@ -770,7 +907,11 @@ def make_kernel(
                         gemm_qk(i_q, kv_pipe.stage, q_desc, k_desc)
                         if i_q == 1:
                             with K.If(elected()), K.Then():
-                                kv_load.empty.arrive(kv_pipe.stage)
+                                kv_load.empty.arrive(
+                                    kv_pipe.stage,
+                                    cta_group=cta_group,
+                                    cta_mask=3 if USE_2CTA else None,
+                                )
                     kv_pipe.advance()
 
                     mma_trip_count = K.local_scalar("int32")
@@ -798,7 +939,11 @@ def make_kernel(
                             gemm_pv(i_q, stage_v, acc, v_desc, v_desc_steady_hi)
                             if i_q == 1:
                                 with K.If(elected()), K.Then():
-                                    kv_load.empty.arrive(stage_v)
+                                    kv_load.empty.arrive(
+                                        stage_v,
+                                        cta_group=cta_group,
+                                        cta_mask=3 if USE_2CTA else None,
+                                    )
                             if i_q == 0:
                                 kv_load.full.wait(kv_pipe.stage, kv_pipe.phase)
                             gemm_qk(i_q, kv_pipe.stage, q_desc_steady, k_desc_steady)
@@ -806,10 +951,18 @@ def make_kernel(
                             if EARLY_Q_RELEASE:
                                 with K.If(i_kv == mma_trip_count - 2), K.Then():
                                     with K.If(elected()), K.Then():
-                                        q_load.empty.arrive(i_q)
+                                        q_load.empty.arrive(
+                                            i_q,
+                                            cta_group=cta_group,
+                                            cta_mask=3 if USE_2CTA else None,
+                                        )
                             if i_q == 1:
                                 with K.If(elected()), K.Then():
-                                    kv_load.empty.arrive(kv_pipe.stage)
+                                    kv_load.empty.arrive(
+                                        kv_pipe.stage,
+                                        cta_group=cta_group,
+                                        cta_mask=3 if USE_2CTA else None,
+                                    )
                         K.assign(acc, 1)
                         kv_pipe.advance()
                         tmem_epoch.advance()
@@ -821,7 +974,11 @@ def make_kernel(
                         gemm_pv(i_q, kv_pipe.stage, acc, v_desc_tail_lo, v_desc_tail_hi)
                         if i_q == 1:
                             with K.If(elected()), K.Then():
-                                kv_load.empty.arrive(kv_pipe.stage)
+                                kv_load.empty.arrive(
+                                    kv_pipe.stage,
+                                    cta_group=cta_group,
+                                    cta_mask=3 if USE_2CTA else None,
+                                )
                         with K.If(elected()), K.Then():
                             commit(o_ready, i_q)
                     kv_pipe.advance()
@@ -829,7 +986,9 @@ def make_kernel(
                     if not EARLY_Q_RELEASE:
                         for i_q in range(SMEM_PIPE_DEPTH_Q):
                             with K.If(elected()), K.Then():
-                                q_load.empty.arrive(i_q)
+                                q_load.empty.arrive(
+                                    i_q, cta_group=cta_group, cta_mask=3 if USE_2CTA else None
+                                )
                     q_epoch.advance()
 
                 with r_idle:
@@ -957,7 +1116,9 @@ def make_kernel(
                     K.cuda.iket.range_end(softmax_fma_token[0])
                     softmax_exp2_token = iket_range("softmax-exp2", leader_only=True)
                     emu_pairs = EMU_PAIRS_CAUSAL if is_causal else EMU_PAIRS_NC
-                    emu_start = EMU_START_CAUSAL if is_causal else EMU_START_NC
+                    emu_start = (
+                        1 if thor_causal_d128 else EMU_START_CAUSAL if is_causal else EMU_START_NC
+                    )
                     for frag_idx in range(4):
                         for i in range(BLK_N // 4 // 2):
                             idx = frag_idx * BLK_N // 4 + 2 * i
@@ -983,7 +1144,7 @@ def make_kernel(
                             tmem((wg_id * 2 * MMA_N + MMA_N + i * BLK_N // 4) // 2),
                         )
                     K.ptx.tcgen05.wait__st.sync.aligned()
-                    p_o_rescale.arrive(wg_id)
+                    p_o_rescale_remote.arrive(wg_id)
                     for i in range(4 - P_SPLIT_Q):
                         tmem_store(
                             p_chunk,
@@ -993,7 +1154,7 @@ def make_kernel(
                     with K.If(warp_id == 0), K.Then():
                         K.cuda.iket.mark("softmax-phase-2")
                     K.ptx.tcgen05.wait__st.sync.aligned()
-                    p_ready_2.arrive(wg_id)
+                    p_ready_2_remote.arrive(wg_id)
                     with K.If(warp_id == 0), K.Then():
                         K.cuda.iket.mark("softmax-phase-3")
                     K.cuda.iket.range_end(softmax_tmem_st_token[0])
@@ -1081,7 +1242,7 @@ def make_kernel(
                     K.cuda.iket.range_end(epi_ld_tmem_token[0])
                     K.ptx.fence.proxy.async_.shared__cta()
                     corr_epi.full.arrive(wg_id)
-                    p_o_rescale.arrive(wg_id)
+                    p_o_rescale_remote.arrive(wg_id)
                     o_epi_epoch.advance()
                 else:
                     with K.If(tid_in_wg < BLK_M), K.Then():
@@ -1142,7 +1303,7 @@ def make_kernel(
                                             mul_f32x2(o_row, 2 * i, acc_scale)
                                         tmem_store(o_row, 0, addr)
                                 K.ptx.tcgen05.wait__st.sync.aligned()
-                        p_o_rescale.arrive(i_q)
+                        p_o_rescale_remote.arrive(i_q)
                         softmax_corr.empty.arrive(1 - i_q)
                         K.cuda.iket.range_end(correction_token[0])
                     softmax_epoch.advance()
@@ -1191,19 +1352,22 @@ def make_kernel(
                         K.cuda.iket.range_end(epi_ld_tmem_token[0])
                         K.ptx.fence.proxy.async_.shared__cta()
                         corr_epi.full.arrive(i_q)
-                        p_o_rescale.arrive(i_q)
+                        p_o_rescale_remote.arrive(i_q)
                     tmem_epoch.advance()
                 softmax_epoch.advance()
 
             scheduler.next_tile()
 
-        # Match the current canonical CTA rendezvous before TMEM teardown.
-        K.cuda.cta_sync()
+        # Match the allocation scope before TMEM teardown.
+        if USE_2CTA:
+            K.cuda.cluster_sync()
+        else:
+            K.cuda.cta_sync()
         with K.If(tvm.tirx.all(wg_id == 0, warp_id == 0)), K.Then():
             dealloc = K.local_scalar("uint32")
             K.ptx.ld.shared.u32(dealloc, tmem_addr.ptr_to([0]))
-            K.ptx[TMEM_RELINQUISH]()
-            K.ptx[TMEM_DEALLOC](dealloc, K.uint32(N_COLS_TMEM))
+            K.ptx[tmem_relinquish]()
+            K.ptx[tmem_dealloc](dealloc, K.uint32(N_COLS_TMEM))
 
     return flash_attention4
 
@@ -1239,13 +1403,45 @@ def _encode(tensor, dims, strides, box):
 
 
 def build_tensor_maps(
-    Q, Kt, V, O, *, batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, head_dim
+    Q,
+    Kt,
+    V,
+    O,
+    *,
+    batch_size,
+    seq_len_q,
+    seq_len_kv,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    is_causal=False,
 ):
     """The seven maps, in the order ``make_kernel``'s parameters declare them."""
     gqa = num_qo_heads // num_kv_heads
     seq_q_per_tile = BLK_M // gqa
+    use_2cta = os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") == "sm_110a" and not is_causal
+    cta_group = 2 if use_2cta else 1
 
-    def qo_map(t):
+    def q_map(t):
+        if gqa == 1:
+            return _encode(
+                t,
+                (head_dim // 2, seq_len_q, batch_size * num_qo_heads * 2),
+                (num_qo_heads * head_dim * F16_BYTES, head_dim),
+                (head_dim // 2, seq_q_per_tile, 1)
+                if use_2cta
+                else (head_dim // 2, seq_q_per_tile, 2),
+            )
+        return _encode(
+            t,
+            (head_dim // 2, num_qo_heads, seq_len_q, batch_size * 2),
+            (head_dim * F16_BYTES, num_qo_heads * head_dim * F16_BYTES, head_dim),
+            (head_dim // 2, gqa, seq_q_per_tile, 1)
+            if use_2cta
+            else (head_dim // 2, gqa, seq_q_per_tile, 2),
+        )
+
+    def o_map(t):
         if gqa == 1:
             return _encode(
                 t,
@@ -1260,15 +1456,23 @@ def build_tensor_maps(
             (head_dim // 2, gqa, seq_q_per_tile, 2),
         )
 
-    def kv_map(t):
+    def k_map(t):
         return _encode(
             t,
             (head_dim // 2, seq_len_kv, batch_size * num_kv_heads * 2),
             (num_kv_heads * head_dim * F16_BYTES, head_dim),
-            (head_dim // 2, BLK_N, 2),
+            (head_dim // 2, BLK_N // cta_group, 1) if use_2cta else (head_dim // 2, BLK_N, 2),
         )
 
-    return (qo_map(Q), qo_map(Q), kv_map(Kt), kv_map(Kt), kv_map(V), kv_map(V), qo_map(O))
+    def v_map(t):
+        return _encode(
+            t,
+            (head_dim // 2, seq_len_kv, batch_size * num_kv_heads * 2),
+            (num_kv_heads * head_dim * F16_BYTES, head_dim),
+            (head_dim // 2, BLK_N, 1) if use_2cta else (head_dim // 2, BLK_N, 2),
+        )
+
+    return (q_map(Q), q_map(Q), k_map(Kt), k_map(Kt), v_map(V), v_map(V), o_map(O))
 
 
 def _select_reg_level(
@@ -1291,7 +1495,8 @@ def get_flash_attention4_kernel(
     os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = _select_reg_level(
         batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, head_dim, is_causal
     )
-    deep_o = is_causal and seq_len_q <= 1024
+    prepare_arch = os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a")
+    deep_o = is_causal and seq_len_q <= 1024 and prepare_arch != "sm_110a"
     return make_kernel(
         batch_size,
         seq_len_q,
@@ -1317,7 +1522,7 @@ def prepare_data(batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, 
 KERNEL_META = {
     "name": "flash_attention4",
     "category": "flashattention",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flash-attn-4",
@@ -1367,6 +1572,7 @@ def _build_launch(
     num_qo_heads,
     num_kv_heads,
     head_dim,
+    is_causal=False,
 ):
     tensor_maps = build_tensor_maps(
         q,
@@ -1379,6 +1585,7 @@ def _build_launch(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        is_causal=is_causal,
     )
     argv = tuple(desc.ptr for desc in tensor_maps)
 
@@ -1423,6 +1630,7 @@ def run_test(batch_size, seq_len, num_qo_heads, num_kv_heads, head_dim, is_causa
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        is_causal=is_causal,
     )
     launch()
     torch.cuda.synchronize()
@@ -1484,104 +1692,29 @@ def run_gpu(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        is_causal=is_causal,
     )
     funcs = {"tir": launch}
 
     def _flashattn_sm100():
-        # Flash-Attention SM100 (CuTeDSL FA4) baseline.
-        #
-        # CUTe-DSL hard rule (discovered by experiment): every `cute_tensor_like`
-        # call must happen BEFORE `cute.compile`. Wrapping new tensors after
-        # compile poisons the host-side `cuTensorMapEncodeTiled` path (it starts
-        # failing ~hundreds of launches later anywhere in the process, including
-        # in unrelated TIR kernels). So we wrap one FA tensor set up-front, then
-        # compile exactly once using it.
-        import cutlass
-        import cutlass.cute as cute
-        import cutlass.torch as cutlass_torch
-        from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-        from flash_attn.cute.utils import AuxData
+        # Use upstream FA4's public adapter so its architecture-specific launch
+        # selection remains part of the source baseline.
+        from flash_attn.cute.interface import _flash_attn_fwd
 
-        Qi, Ki, Vi, _ = prepare_data(
-            batch_size, seq_len, seq_len, num_qo_heads, num_kv_heads, head_dim
-        )
-        Qf = Qi.cuda().contiguous()
-        Kf = Ki.cuda().contiguous()
-        Vf = Vi.cuda().contiguous()
-        Of = torch.zeros_like(Qf)
-        q_t, q_th = cutlass_torch.cute_tensor_like(
-            Qf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        k_t, k_th = cutlass_torch.cute_tensor_like(
-            Kf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        v_t, v_th = cutlass_torch.cute_tensor_like(
-            Vf, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-        o_t, o_th = cutlass_torch.cute_tensor_like(
-            Of, cutlass.Float16, is_dynamic_layout=True, assumed_align=16
-        )
-
-        fa_fwd = FlashAttentionForwardSm100(
-            head_dim=head_dim,
-            head_dim_v=head_dim,
-            qhead_per_kvhead=num_qo_heads // num_kv_heads,
-            is_causal=is_causal,
-            is_local=False,
-            pack_gqa=False,
-            m_block_size=128,
-            n_block_size=128,
-            is_persistent=True,
-        )
-        _stream_fa = cutlass_torch.default_stream()
-        _scale_fa = 1.0 / math.sqrt(head_dim)
-        compiled_fa = cute.compile(
-            fa_fwd,
-            q_t,
-            k_t,
-            v_t,
-            o_t,
-            None,  # mLSE
-            _scale_fa,  # softmax_scale
-            None,  # mCuSeqlensQ
-            None,  # mCuSeqlensK
-            None,  # mSeqUsedQ
-            None,  # mSeqUsedK
-            None,  # mPageTable
-            None,  # window_size_left
-            None,  # window_size_right
-            None,  # learnable_sink
-            None,  # descale_tensors
-            None,  # blocksparse_tensors
-            AuxData(),  # aux_data (FA4 takes an AuxData, not None)
-            _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
-        )
+        out_fa4 = torch.empty_like(O_tir)
+        call_kwargs = {
+            "q": Q_cuda,
+            "k": K_cuda,
+            "v": V_cuda,
+            "out": out_fa4,
+            "softmax_scale": 1.0 / math.sqrt(head_dim),
+            "causal": is_causal,
+        }
 
         def run():
-            compiled_fa(
-                q_t,
-                k_t,
-                v_t,
-                o_t,
-                None,  # mLSE
-                _scale_fa,
-                None,  # mCuSeqlensQ
-                None,  # mCuSeqlensK
-                None,  # mSeqUsedQ
-                None,  # mSeqUsedK
-                None,  # mPageTable
-                None,  # window_size_left
-                None,  # window_size_right
-                None,  # learnable_sink
-                None,  # descale_tensors
-                None,  # blocksparse_tensors
-                AuxData(),  # aux_data (FA4 takes an AuxData, not None)
-                _stream_fa,  # stream (FA4 sm100 keeps stream as the LAST positional)
-            )
+            _flash_attn_fwd(**call_kwargs)
 
-        # Keep the backing torch storage alive for the run's lifetime
-        # (the cute tensors alias it).
-        run._fa_keep_alive = (q_th, k_th, v_th, o_th, Qf, Kf, Vf, Of)
+        run._fa4_keep_alive = (out_fa4, call_kwargs)
         return run
 
     return bench(
@@ -1693,6 +1826,7 @@ def _profile_iket_workload(args: argparse.Namespace) -> None:
         num_qo_heads=args.num_qo_heads,
         num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
+        is_causal=args.causal,
     )
     for _ in range(args.repeat):
         launch()

@@ -523,6 +523,14 @@ Grouped workloads show one row per config and one timing column per implementati
 
 ## Jetson AGX Thor (`sm_110a`)
 
+### flash_attention4
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `s1024_h32kv4` | tir | 155.3829 | flashattn_sm100 | 165.1326 | 1.063 | — |
+| `s4096_h32kv4_causal` | tir | 890.7954 | flashattn_sm100 | 929.1618 | 1.043 | — |
+| `s8192_h32kv32` | tir | 8086.6973 | flashattn_sm100 | 8267.8324 | 1.022 | — |
+
 ### fp16_bf16_gemm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
