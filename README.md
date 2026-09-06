@@ -20,7 +20,7 @@ keeps them in sync.
 | `sm_100a` | 101 |
 | `sm_103a` | 96 |
 | `sm_107a` | 94 |
-| `sm_110a` | 4 |
+| `sm_110a` | 5 |
 
 ### Native TIRx
 
@@ -78,7 +78,7 @@ contract and results.
 ### FlashAttention ports
 
 - **Forward:**
-  [`flash_attention4`](tirx_kernels/flashattention/flash_attention4.py),
+  [`flash_attention4`](tirx_kernels/flashattention/flash_attention4.py) ⟨+sm_110a⟩,
   [`flash_attention4_fp4`](tirx_kernels/flashattention/flash_attention4_fp4.py) ⟨sm_103a⟩
 - **Backward:**
   [`flash_attention_backward_sm100`](tirx_kernels/flashattention/flash_attention_backward.py)
