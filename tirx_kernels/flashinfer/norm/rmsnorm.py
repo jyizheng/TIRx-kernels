@@ -150,24 +150,28 @@ def _butterfly_sum_f32(acc, lane_xors: tuple[int, ...]) -> None:
         K.ptx.add.f32(acc, acc, K.reinterpret("float32", peer))
 
 
-def _load_global_bits(values, value_offset: int, buffer, index, vec: int) -> None:
+def _load_global_bits(
+    values, value_offset: int, buffer, index, vec: int, *, l1_evict_first: bool = False
+) -> None:
     """``values[value_offset : +vec]`` <- *vec* halves at ``buffer[index]``.
 
     One ``ld.global`` of the widest shape the vector width allows; the b32
     forms land two halves per word and are split into the half lanes.
     """
+    if l1_evict_first:
+        load = K.ptx["ld.global.L1::evict_first.L2::128B"]
+    else:
+        load = K.ptx.ld.global_
     if vec == 1:
-        K.ptx.ld.global_.b16(values[value_offset], buffer.ptr_to([index]))
+        load.b16(values[value_offset], buffer.ptr_to([index]))
     elif vec == 2:
-        K.ptx.ld.global_.v2.b16(
-            values[value_offset], values[value_offset + 1], buffer.ptr_to([index])
-        )
+        load.v2.b16(values[value_offset], values[value_offset + 1], buffer.ptr_to([index]))
     else:
         words = K.alloc_local([vec // 2], K.u32)
         if vec == 4:
-            K.ptx.ld.global_.v2.b32(words[0], words[1], buffer.ptr_to([index]))
+            load.v2.b32(words[0], words[1], buffer.ptr_to([index]))
         else:
-            K.ptx.ld.global_.v4.b32(words[0], words[1], words[2], words[3], buffer.ptr_to([index]))
+            load.v4.b32(words[0], words[1], words[2], words[3], buffer.ptr_to([index]))
         for pair in range(vec // 2):
             K.assign(
                 values[value_offset + pair * 2],
@@ -464,6 +468,17 @@ def get_kernel(
     _validate(variant, dtype, M, H, input_layout, output_layout, eps)
     compact = _uses_compact_specialization(M, H, input_layout, output_layout)
     source = _source_config(H)
+    # A wider CTA plus register-resident input wins for this cold-cache Thor row.
+    if _preparing_for_thor() and variant == "rmsnorm" and dtype == "bfloat16" and H == 8192:
+        source = {
+            **source,
+            "tpr": 256,
+            "threads": 256,
+            "rows": 1,
+            "warps_per_row": 8,
+            "vec_blocks": 4,
+            "smem_bytes": 32,
+        }
     cluster_n = int(source["cluster_n"])
     tpr = int(source["tpr"])
     threads = int(source["threads"])
@@ -496,9 +511,18 @@ def get_kernel(
     thor_parallel_reduction = is_thor and H in (4096, 8192)
     thor_bf16_reduction = thor_parallel_reduction and dtype == "bfloat16" and use_async
     thor_keep_bf16_x = thor_bf16_reduction
-    thor_reduction_partials = 8 if H == 4096 else 4
+    thor_reduction_partials = 8 if H == 4096 or (variant == "rmsnorm" and H == 8192) else 4
+    thor_leader_warp_finalize = (
+        is_thor
+        and variant == "rmsnorm"
+        and dtype == "bfloat16"
+        and H == 8192
+        and cluster_n == 1
+        and tpr == 256
+    )
+    thor_direct_x = thor_leader_warp_finalize
     copy_bytes = copy_bits // 8
-    reduce_base = tile_bytes if use_async else 0
+    reduce_base = 0 if thor_direct_x else (tile_bytes if use_async else 0)
     reduce_count = rows * warps_per_row * cluster_n
     mbar_offset = reduce_base + reduce_count * 4
     expected_bytes = reduce_count * 4
@@ -610,7 +634,13 @@ def get_kernel(
             else:
                 x_offset = row_i64 * x_row_stride + K.cast(absolute_col, "int64")
 
-            if use_async:
+            if thor_direct_x:
+                if thor_full_rows and thor_full_cols:
+                    _load_global_bits(x_bits, vb * vec, x, x_offset, vec, l1_evict_first=True)
+                else:
+                    with K.If(K.And(row_valid, col_valid)), K.Then():
+                        _load_global_bits(x_bits, vb * vec, x, x_offset, vec, l1_evict_first=True)
+            elif use_async:
                 if thor_full_rows:
                     source_bytes = (
                         K.uint32(copy_bytes)
@@ -640,7 +670,7 @@ def get_kernel(
                     with K.If(K.And(row_valid, col_valid)), K.Then():
                         _load_global_bits(x_bits, vb * vec, x, x_offset, vec)
 
-        if use_async:
+        if use_async and not thor_direct_x:
             K.ptx.cp.async_.commit_group()
 
         for vb in range(vec_blocks):
@@ -652,7 +682,7 @@ def get_kernel(
                 with K.If(absolute_col < H), K.Then():
                     _load_global_bits(w_bits, vb * vec, weight, absolute_col, vec)
 
-        if use_async:
+        if use_async and not thor_direct_x:
             K.ptx.cp.async_.wait_group(0)
             for vb in range(vec_blocks):
                 local_col = (thread_in_row + vb * tpr) * vec
@@ -704,14 +734,34 @@ def get_kernel(
                 )
             K.ptx.bar.sync(K.uint32(0))
             final_sum = K.local_scalar(K.f32, init=K.float32(0.0))
-            with K.If(lane < warps_per_row), K.Then():
-                reduce_word = K.local_scalar(K.u32)
-                K.ptx.ld.shared.b32(
-                    reduce_word, shared_raw.ptr_to([reduce_base + (row_warp + lane * rows) * 4])
-                )
-                K.assign(final_sum, K.reinterpret("float32", reduce_word))
-            _butterfly_sum_f32(final_sum, full_lane_xors)
-            sum_sq = final_sum
+            if thor_leader_warp_finalize:
+                with K.If(warp_in_row == 0), K.Then():
+                    with K.If(lane < warps_per_row), K.Then():
+                        reduce_word = K.local_scalar(K.u32)
+                        K.ptx.ld.shared.b32(
+                            reduce_word,
+                            shared_raw.ptr_to([reduce_base + (row_warp + lane * rows) * 4]),
+                        )
+                        K.assign(final_sum, K.reinterpret("float32", reduce_word))
+                    _butterfly_sum_f32(final_sum, full_lane_xors)
+                    with K.If(lane == 0), K.Then():
+                        K.ptx.st.shared.b32(
+                            shared_raw.ptr_to([reduce_base + row_warp * 4]),
+                            K.reinterpret("uint32", final_sum),
+                        )
+                K.ptx.bar.sync(K.uint32(0))
+                final_word = K.local_scalar(K.u32)
+                K.ptx.ld.shared.b32(final_word, shared_raw.ptr_to([reduce_base + row_warp * 4]))
+                sum_sq = K.reinterpret("float32", final_word)
+            else:
+                with K.If(lane < warps_per_row), K.Then():
+                    reduce_word = K.local_scalar(K.u32)
+                    K.ptx.ld.shared.b32(
+                        reduce_word, shared_raw.ptr_to([reduce_base + (row_warp + lane * rows) * 4])
+                    )
+                    K.assign(final_sum, K.reinterpret("float32", reduce_word))
+                _butterfly_sum_f32(final_sum, full_lane_xors)
+                sum_sq = final_sum
         elif cluster_n > 1:
             with K.If(warp == 0), K.Then():
                 with K.If(K.cuda.elect_sync()), K.Then():
@@ -1078,6 +1128,27 @@ def _flashinfer_api(variant: str, device):
     return api, flashinfer_norm
 
 
+def _compile_tirx(config: dict[str, Any]):
+    from tirx_kernels.runner import compile_kernel
+
+    use_thor_h8192_schedule = (
+        _preparing_for_thor()
+        and config["variant"] == "rmsnorm"
+        and config["dtype"] == "bfloat16"
+        and int(config["H"]) == 8192
+    )
+    previous = os.environ.get("TVM_CUDA_PTXAS_REG_LEVEL")
+    if use_thor_h8192_schedule:
+        os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = "2"
+    try:
+        return compile_kernel(get_kernel(**config))
+    finally:
+        if previous is None:
+            os.environ.pop("TVM_CUDA_PTXAS_REG_LEVEL", None)
+        else:
+            os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = previous
+
+
 def _launch_tirx(executable, data, output, config: dict[str, Any]) -> None:
     M = int(config["M"])
     H = int(config["H"])
@@ -1130,8 +1201,6 @@ def run_test(**config: Any) -> None:
     """Compile, launch, and validate one config."""
     import torch
 
-    from tirx_kernels.runner import compile_kernel
-
     config = dict(config)
     M = int(config["M"])
     H = int(config["H"])
@@ -1144,8 +1213,7 @@ def run_test(**config: Any) -> None:
     output = _prepare_output(M, H, data["y_row_stride"], dtype, initialize_padding=True)
     reference_out = _prepare_output(M, H, data["y_row_stride"], dtype, initialize_padding=True)
 
-    kernel = get_kernel(**config)
-    executable = compile_kernel(kernel)
+    executable = _compile_tirx(config)
     _launch_tirx(executable, data, output, config)
 
     api, flashinfer_norm = _flashinfer_api(variant, data["x"].device)
@@ -1186,9 +1254,9 @@ def run_test(**config: Any) -> None:
 
 def prepare_bench(**config: Any):
     """Compile the selected TIRx specialization before GPU assignment."""
-    from tirx_kernels.runner import compile_kernel, prepared_gpu_benchmark
+    from tirx_kernels.runner import prepared_gpu_benchmark
 
-    state = {"config": dict(config), "executable": compile_kernel(get_kernel(**config))}
+    state = {"config": dict(config), "executable": _compile_tirx(dict(config))}
     return prepared_gpu_benchmark(run_gpu, state)
 
 
