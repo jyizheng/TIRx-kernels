@@ -531,6 +531,14 @@ Grouped workloads show one row per config and one timing column per implementati
 | `s4096_h32kv4_causal` | tir | 890.7954 | flashattn_sm100 | 929.1618 | 1.043 | — |
 | `s8192_h32kv32` | tir | 8086.6973 | flashattn_sm100 | 8267.8324 | 1.022 | — |
 
+### flashinfer_layernorm
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `bf16_m1_h128_xc_yc_pdl0_eps1e6` | tirx | 2.9773 | flashinfer_cutedsl | 3.1874 | 1.071 | — |
+| `bf16_m128_h1024_xc_yc_pdl0_eps1e6` | tirx | 6.2452 | flashinfer_cutedsl | 7.2593 | 1.162 | — |
+| `bf16_m128_h16384_xc_yc_pdl0_eps1e6` | tirx | 64.8166 | flashinfer_cutedsl | 75.6959 | 1.168 | — |
+
 ### flashinfer_qk_rmsnorm
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
