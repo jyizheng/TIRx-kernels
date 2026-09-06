@@ -20,7 +20,7 @@ keeps them in sync.
 | `sm_100a` | 103 |
 | `sm_103a` | 98 |
 | `sm_107a` | 94 |
-| `sm_110a` | 7 |
+| `sm_110a` | 8 |
 
 ### Native TIRx
 
@@ -104,7 +104,7 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`flashinfer_rmsnorm_quant`](tirx_kernels/flashinfer/norm/rmsnorm_quant.py),
   [`flashinfer_rmsnorm_fp4quant`](tirx_kernels/flashinfer/norm/rmsnorm_fp4quant.py),
   [`flashinfer_add_rmsnorm_fp4quant`](tirx_kernels/flashinfer/norm/add_rmsnorm_fp4quant.py),
-  [`flashinfer_layernorm`](tirx_kernels/flashinfer/norm/layernorm.py),
+  [`flashinfer_layernorm`](tirx_kernels/flashinfer/norm/layernorm.py) ⟨+sm_110a⟩,
   [`flashinfer_fused_add_rmsnorm`](tirx_kernels/flashinfer/norm/fused_add_rmsnorm.py) ⟨sm_100a⟩,
   [`flashinfer_fused_add_rmsnorm_quant`](tirx_kernels/flashinfer/norm/fused_add_rmsnorm_quant.py),
   [`flashinfer_fused_dit_layernorm`](tirx_kernels/flashinfer/norm/fused_dit_layernorm.py),

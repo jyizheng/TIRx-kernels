@@ -11,15 +11,16 @@ The source implementation is ``LayerNormKernel`` in
 ``flashinfer/norm/utils.py``.
 """
 
+import os
 from typing import Any
 
 import tirx_kernels.kern as K
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, bench
 
 KERNEL_META = {
     "name": "flashinfer_layernorm",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -36,6 +37,10 @@ _DEFAULT_EPS = 1e-6
 _LAYOUTS = ("compact", "strided")
 _GUARD_ELEMENTS = 64
 _GUARD_VALUE = 123.0
+
+
+def _preparing_for_thor() -> bool:
+    return os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") == "sm_110a"
 
 
 def _ceil_div(lhs: int, rhs: int) -> int:
@@ -169,6 +174,46 @@ def _load_x(buffer, index, values, value_offset, VEC: int):
             )
 
 
+def _load_affine_f32x8(gamma, beta, index, gamma_frag, beta_frag, value_offset):
+    gamma_words = K.alloc_local([4], K.u64)
+    beta_words = K.alloc_local([4], K.u64)
+    K.ptx.ld.global_.v4.b64(
+        gamma_words[0], gamma_words[1], gamma_words[2], gamma_words[3], gamma.ptr_to([index])
+    )
+    K.ptx.ld.global_.v4.b64(
+        beta_words[0], beta_words[1], beta_words[2], beta_words[3], beta.ptr_to([index])
+    )
+    for pair in range(4):
+        K.ptx.mov.b64(
+            gamma_frag[value_offset + pair * 2],
+            gamma_frag[value_offset + pair * 2 + 1],
+            gamma_words[pair],
+        )
+        K.ptx.mov.b64(
+            beta_frag[value_offset + pair * 2],
+            beta_frag[value_offset + pair * 2 + 1],
+            beta_words[pair],
+        )
+
+
+def _load_affine_f32x4(gamma, beta, index, gamma_frag, beta_frag, value_offset):
+    gamma_words = K.alloc_local([2], K.u64)
+    beta_words = K.alloc_local([2], K.u64)
+    K.ptx.ld.global_.v2.b64(gamma_words[0], gamma_words[1], gamma.ptr_to([index]))
+    K.ptx.ld.global_.v2.b64(beta_words[0], beta_words[1], beta.ptr_to([index]))
+    for pair in range(2):
+        K.ptx.mov.b64(
+            gamma_frag[value_offset + pair * 2],
+            gamma_frag[value_offset + pair * 2 + 1],
+            gamma_words[pair],
+        )
+        K.ptx.mov.b64(
+            beta_frag[value_offset + pair * 2],
+            beta_frag[value_offset + pair * 2 + 1],
+            beta_words[pair],
+        )
+
+
 def _store_y(buffer, index, bits, words, value_offset, word_offset, VEC: int):
     if VEC == 1:
         K.ptx.st.global_.b16(buffer.ptr_to([index]), bits[value_offset])
@@ -284,6 +329,8 @@ def get_kernel(
     mixed_local_sum = bool(source["mixed_local_sum"])
     packed_pairs = _ceil_div(total_values, 2)
     pair_values = packed_pairs * 2
+    thor_vector_affine = _preparing_for_thor() and vec in (4, 8)
+    full_affine_tile = int(source["cols"]) == H
 
     x_stride_hint = int(kwargs.get("x_row_stride", H if input_layout == "compact" else 2 * H))
     y_stride_hint = int(kwargs.get("y_row_stride", H if output_layout == "compact" else 2 * H))
@@ -427,13 +474,33 @@ def get_kernel(
         for value in range(total_values):
             K.assign(gamma_frag[value], K.float32(0.0))
             K.assign(beta_frag[value], K.float32(0.0))
-        for vb in range(vec_blocks):
-            for e in range(vec):
-                value = vb * vec + e
-                col = tid * vec + vb * threads * vec + e
-                with K.If(col < H), K.Then():
-                    K.ptx.ld.global_.b32(gamma_frag[value], gamma.ptr_to([col]))
-                    K.ptx.ld.global_.b32(beta_frag[value], beta.ptr_to([col]))
+        if thor_vector_affine:
+            for vb in range(vec_blocks):
+                value_offset = vb * vec
+                col = tid * vec + vb * threads * vec
+                if full_affine_tile:
+                    if vec == 8:
+                        _load_affine_f32x8(gamma, beta, col, gamma_frag, beta_frag, value_offset)
+                    else:
+                        _load_affine_f32x4(gamma, beta, col, gamma_frag, beta_frag, value_offset)
+                else:
+                    with K.If(col < H), K.Then():
+                        if vec == 8:
+                            _load_affine_f32x8(
+                                gamma, beta, col, gamma_frag, beta_frag, value_offset
+                            )
+                        else:
+                            _load_affine_f32x4(
+                                gamma, beta, col, gamma_frag, beta_frag, value_offset
+                            )
+        else:
+            for vb in range(vec_blocks):
+                for e in range(vec):
+                    value = vb * vec + e
+                    col = tid * vec + vb * threads * vec + e
+                    with K.If(col < H), K.Then():
+                        K.ptx.ld.global_.b32(gamma_frag[value], gamma.ptr_to([col]))
+                        K.ptx.ld.global_.b32(beta_frag[value], beta.ptr_to([col]))
 
         y_f32 = K.alloc_local([pair_values], K.f32)
         if total_values == 1:
