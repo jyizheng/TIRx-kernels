@@ -10,15 +10,16 @@ The source implementation is ``QKRMSNormKernel`` and
 public dispatch is in ``flashinfer/norm/__init__.py``.
 """
 
+import os
 from typing import Any
 
 import tirx_kernels.kern as K
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, bench
 
 KERNEL_META = {
     "name": "flashinfer_qk_rmsnorm",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -48,6 +49,10 @@ _CVT_FROM_F32 = {"float16": "cvt.rn.f16.f32", "bfloat16": "cvt.rn.bf16.f32"}
 _CVT_PAIR_FROM_F32 = {"float16": "cvt.rn.f16x2.f32", "bfloat16": "cvt.rn.bf16x2.f32"}
 _FMA_HALF_TO_F32 = {"float16": "fma.rn.f32.f16", "bfloat16": "fma.rn.f32.bf16"}
 _CP_ASYNC = "cp.async.ca.shared.global"
+
+
+def _preparing_for_thor() -> bool:
+    return os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") == "sm_110a"
 
 
 def _ceil_div(lhs: int, rhs: int) -> int:
@@ -429,6 +434,8 @@ def get_kernel(
     # The packed x staging is only reachable on the synchronous full-tile
     # power-of-two shape; elsewhere the f32 lanes carry x directly.
     packed_x_pairs = not use_async and full_tile and vb_pow2
+    thor_predicated_async = _preparing_for_thor() and H == 128
+    thor_static_n = thor_predicated_async and N & (N - 1) == 0
 
     for name in ("x_batch_stride", "x_head_stride", "y_batch_stride", "y_head_stride"):
         stride = kwargs.get(name)
@@ -477,9 +484,20 @@ def get_kernel(
         row_i32 = K.local_scalar(K.i32, init=block * rows + row_in_cta)
         row_i64 = K.cast(row_i32, "int64")
         row_valid = row_i64 < runtime_B * runtime_N
-        # One 64-bit divide and remainder per thread: must run once.
-        batch_idx = K.local_scalar(K.i64, init=row_i64 // runtime_N)
-        head_idx = K.local_scalar(K.i64, init=row_i64 % runtime_N)
+        if thor_static_n:
+            batch_idx = K.local_scalar(K.i64)
+            head_idx = K.local_scalar(K.i64)
+            with K.If(runtime_N == K.int64(N)):
+                with K.Then():
+                    K.assign(batch_idx, row_i64 // K.int64(N))
+                    K.assign(head_idx, row_i64 % K.int64(N))
+                with K.Else():
+                    K.assign(batch_idx, row_i64 // runtime_N)
+                    K.assign(head_idx, row_i64 % runtime_N)
+        else:
+            # One 64-bit divide and remainder per thread: must run once.
+            batch_idx = K.local_scalar(K.i64, init=row_i64 // runtime_N)
+            head_idx = K.local_scalar(K.i64, init=row_i64 % runtime_N)
         warp = tid // 32
         lane = tid % 32
         row_warp = warp // warps_per_row
@@ -522,15 +540,24 @@ def get_kernel(
                 batch_idx * x_batch_stride + head_idx * x_head_stride + K.cast(local_col, "int64")
             )
             if use_async:
-                with K.If(row_valid), K.Then():
-                    # Ignore-src: an out-of-range column copies nothing and the
-                    # staged bytes read back as zero.
+                if thor_predicated_async:
                     K.ptx[_CP_ASYNC](
                         shared_raw.ptr_to([(row_in_cta * cols + local_col) * _ELEM_BYTES]),
                         x.ptr_to([x_offset]),
                         copy_bytes,
                         K.cast(K.if_then_else(col_valid, copy_bytes, 0), "uint32"),
+                        pred=row_valid,
                     )
+                else:
+                    with K.If(row_valid), K.Then():
+                        # Ignore-src: an out-of-range column copies nothing and the
+                        # staged bytes read back as zero.
+                        K.ptx[_CP_ASYNC](
+                            shared_raw.ptr_to([(row_in_cta * cols + local_col) * _ELEM_BYTES]),
+                            x.ptr_to([x_offset]),
+                            copy_bytes,
+                            K.cast(K.if_then_else(col_valid, copy_bytes, 0), "uint32"),
+                        )
             else:
                 with K.If(K.And(row_valid, col_valid)), K.Then():
                     if sync_x_packed:
