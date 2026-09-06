@@ -112,6 +112,13 @@ def test_setmaxnreg_requires_pinned_entry_allocation():
     assert check_low_level_ir(build(1)).ok
 
 
+def test_fp8_msa_decode_satisfies_the_default_ir_contract():
+    from tirx_kernels.registry import load_kernel
+
+    kernel = load_kernel("blackwell_msa_decode_uniform_fp8_qkv_paged_sm100").get_kernel()
+    assert check_low_level_ir(kernel).ok
+
+
 def test_correctness_runner_does_not_rebuild_an_already_checked_kernel():
     class KernelModule:
         @staticmethod
