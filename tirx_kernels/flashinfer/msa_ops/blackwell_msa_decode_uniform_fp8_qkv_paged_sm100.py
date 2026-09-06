@@ -45,11 +45,7 @@ SMEM_TOTAL = 156672
 TMEM_COLS = 512
 CUDA_ARCH = "sm_100a"
 
-# TIRx's nvcc path defaults ptxas `--register-usage-level` to 10.  A targeted
-# 0..6 sweep found level 2 best for this source-exact warp-specialized kernel:
-# it keeps 151 registers with no stack or local traffic while improving the
-# q5/q16 schedule by roughly 1.4%/1.7% over level 10 on GB200.
-_PTXAS_REG_LEVEL = "2"
+_PTXAS_REG_LEVEL = "10"
 
 
 def _config(
@@ -457,16 +453,7 @@ def _commit2(addr0, addr1):
 
 def _build_kernel():
     @K.kernel(
-        warps=NUM_WARPS,
-        arch=CUDA_ARCH,
-        grid=_grid,
-        host_prelude=_host_prelude,
-        # The pinned CUDA source legally uses setmaxnreg with one-operand
-        # __launch_bounds__(384).  K's generic low-level check models
-        # setmaxnreg direction only for a pinned occupancy, so opt out here
-        # rather than inventing the .minnctapersm attribute rejected by the
-        # source/sketch review.  The body still uses only K PTX statements.
-        check_ir=False,
+        warps=NUM_WARPS, arch=CUDA_ARCH, min_blocks_per_sm=1, grid=_grid, host_prelude=_host_prelude
     )
     def blackwell_msa_decode_uniform_fp8_qkv_paged_sm100(
         q: K.gptr[K.u8],
@@ -513,11 +500,13 @@ def _build_kernel():
         taddr = K.local_scalar("uint32")
         K.ptx.ld.volatile.shared.b32(taddr, _bar(smem, _SMEM_TMEM_MAILBOX))
 
+        # Entry allocation is 168/thread: WG2 releases 16 * 128 registers,
+        # exactly funding the 8 * 128 requested by each of WG0 and WG1.
         with K.If(K.And(warp >= _i32(8), warp <= _i32(11))), K.Then():
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(_u32(96))
+            K.ptx.setmaxnreg.dec.sync.aligned.u32(_u32(152))
         K.cuda.cta_sync()
         with K.If(warp <= _i32(7)), K.Then():
-            K.ptx.setmaxnreg.inc.sync.aligned.u32(_u32(232))
+            K.ptx.setmaxnreg.inc.sync.aligned.u32(_u32(176))
         K.cuda.cta_sync()
 
         total_work = K.cast(total_q * num_kv_heads, "uint32")
