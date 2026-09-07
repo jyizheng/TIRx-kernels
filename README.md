@@ -20,7 +20,7 @@ keeps them in sync.
 | `sm_100a` | 103 |
 | `sm_103a` | 98 |
 | `sm_107a` | 94 |
-| `sm_110a` | 8 |
+| `sm_110a` | 10 |
 
 ### Native TIRx
 
@@ -153,8 +153,8 @@ Grouped by the FlashInfer Python entry point each port backs.
 - **`flashinfer.fused_moe`:**
   [`blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin`](tirx_kernels/flashinfer/fused_moe/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin.py) ⟨sm_107a⟩
 - **`flashinfer.topk`:**
-  [`fast_topk_clusters`](tirx_kernels/flashinfer/topk/fast_topk_clusters.py),
-  [`filtered_topk`](tirx_kernels/flashinfer/topk/filtered_topk.py),
+  [`fast_topk_clusters`](tirx_kernels/flashinfer/topk/fast_topk_clusters.py) ⟨+sm_110a⟩,
+  [`filtered_topk`](tirx_kernels/flashinfer/topk/filtered_topk.py) ⟨+sm_110a⟩,
   [`radix_topk_multi_cta`](tirx_kernels/flashinfer/topk/radix_topk_multi_cta.py),
   [`radix_topk_single_cta`](tirx_kernels/flashinfer/topk/radix_topk_single_cta.py),
   [`stable_sort_topk_by_value`](tirx_kernels/flashinfer/topk/stable_sort_topk_by_value.py)

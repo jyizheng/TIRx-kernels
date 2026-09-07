@@ -52,18 +52,19 @@ and ``num_clusters`` outside ``{1, 2, 4, 8}`` (the launcher degrades it to 1
 before the kernel sees it, ``:607-611``).
 """
 
+import os
 from typing import Any
 
 import tirx_kernels.kern as K
 from tirx_kernels.flashinfer.utils import topk_radix as R
 from tirx_kernels.flashinfer.utils.filtered_topk_ops import st_global_bits
 from tirx_kernels.flashinfer.utils.topk_harness import source_module, torch_dtype
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, bench, hardware_num_sms
 
 KERNEL_META = {
     "name": "fast_topk_clusters",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -162,6 +163,21 @@ def clusters_for(batch_size: int, seq_len: int) -> int:
     return 1
 
 
+def _tirx_clusters_for(batch_size: int, seq_len: int) -> int:
+    """Use row-level parallelism when it already supplies three Thor waves."""
+    source_clusters = clusters_for(batch_size, seq_len)
+    if (
+        os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") == "sm_110a"
+        and source_clusters > 1
+        and batch_size >= 3 * hardware_num_sms()
+    ):
+        if seq_len <= 2 * SHORT_ROW_CLUSTER_LIMIT:
+            return 1
+        if source_clusters > 2 and seq_len <= 8 * SHORT_ROW_CLUSTER_LIMIT:
+            return 2
+    return source_clusters
+
+
 # Global memory goes through raw PTX, never TensorLoad/BufferStore: the repo's
 # low-level IR contract rejects the latter outright (db entry
 # `express-low-level-memory-access-through-raw-ptx`).
@@ -250,7 +266,7 @@ def get_kernel(
     is32 = dtype == "float32"
     rounds = 4 if is32 else 2  # NRemainingRounds + 1 (:90)
     lshift_start = 8 * (4 if is32 else 2) - 8  # (:91)
-    nc = clusters_for(batch, seq_len)
+    nc = _tirx_clusters_for(batch, seq_len)
     num_cached = num_cached_for_device(k)
     ovf_stride = seq_len // nc  # binding:47, from the row stride
     plain = mode == "plain"
