@@ -1,0 +1,9 @@
+kernel: agent_evolved_kda_forward_b1_t8192_varlen
+selection_rationale: The three defaults span both scored head counts and all three dispatch classes the kernel compiles -- the single fixed sequence, the uniform pack, and the general varlen pack.
+configs:
+  - {config: b1_t8192_h96_fixed_k128_v128_bf16, default: true, selection_role: large, timer: proton}
+  - {config: b1_t8192_h96_mixed_varlen_k128_v128_bf16, default: true, selection_role: medium, timer: proton}
+  - {config: b1_t8192_h96_uniform_varlen_k128_v128_bf16, default: false, timer: proton}
+  - {config: b1_t8192_h64_fixed_k128_v128_bf16, default: false, timer: proton}
+  - {config: b1_t8192_h64_mixed_varlen_k128_v128_bf16, default: false, timer: proton}
+  - {config: b1_t8192_h64_uniform_varlen_k128_v128_bf16, default: true, selection_role: small, timer: proton}
