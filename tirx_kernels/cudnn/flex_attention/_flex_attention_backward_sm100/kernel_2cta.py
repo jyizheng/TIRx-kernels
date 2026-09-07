@@ -589,24 +589,21 @@ def get_kernel_2cta(**config):
 
         is_mha = qhead_per_kvhead == 1
         if is_mha and not deterministic:
-            compute_regs, producer_regs, mma_regs = 144, 96, 96
-        elif is_mha:
-            compute_regs, producer_regs, mma_regs = 136, 96, 112
+            compute_regs, producer_regs = 144, 96
         else:
-            compute_regs, producer_regs, mma_regs = 136, 112, 112
+            compute_regs, producer_regs = 136, 112
         sp = K.specialize(chain_dispatch=True)
-        r_empty = sp.role("empty", warps=[15])
-        r_relay = sp.role("relay", warps=[14])
-        r_load = sp.role("load", warps=[13])
-        r_mma = sp.role("mma", warps=[12])
-        r_compute = sp.role("compute", warps=list(range(4, 12)))
-        r_reduce = sp.role("reduce", warps=list(range(4)))
+        r_empty = sp.role("empty", warps=[15], regs=producer_regs)
+        r_relay = sp.role("relay", warps=[14], regs=producer_regs)
+        r_load = sp.role("load", warps=[13], regs=producer_regs)
+        r_mma = sp.role("mma", warps=[12], regs=producer_regs)
+        r_compute = sp.role("compute", warps=list(range(4, 12)), regs=compute_regs)
+        r_reduce = sp.role("reduce", warps=list(range(4)), regs=128)
 
         with r_empty:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(24))
+            pass
 
         with r_relay:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(producer_regs))
             relay_phase = K.local_scalar("int32", init=K.int32(0))
             edge = K.local_scalar("int32", init=K.int32(0))
             with K.While(edge < count):
@@ -617,7 +614,6 @@ def get_kernel_2cta(**config):
                 K.assign(edge, edge + K.int32(1))
 
         with r_load:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(producer_regs))
             elected = K.local_scalar("uint32", init=K.cuda.elect_sync())
             with K.If(elected != K.uint32(0)), K.Then():
                 for tensor_map in (q_map, qt_map, k_map, kt_map, v_map, do_map, dot_map):
@@ -987,7 +983,6 @@ def get_kernel_2cta(**config):
                         )
 
         with r_mma:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(mma_regs))
             K.ptx.tcgen05.alloc.cta_group__2.sync.aligned.shared__cta.b32(
                 K.address_of(tmem_mailbox), K.uint32(TMEM_COLUMNS)
             )
@@ -1215,7 +1210,6 @@ def get_kernel_2cta(**config):
             K.ptx["tcgen05.dealloc.cta_group::2.sync.aligned.b32"](tcol, K.uint32(TMEM_COLUMNS))
 
         with r_compute:
-            K.ptx.setmaxnreg.inc.sync.aligned.u32(K.uint32(compute_regs))
             K.ptx.barrier.sync(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
             tcol = K.local_scalar("uint32")
             K.ptx.ld.shared.u32(tcol, tmem_mailbox.ptr_to([0]))
@@ -1706,7 +1700,6 @@ def get_kernel_2cta(**config):
             K.ptx.bar.arrive(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
 
         with r_reduce:
-            K.ptx.setmaxnreg.inc.sync.aligned.u32(K.uint32(128))
             K.ptx.barrier.sync(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
             tcol = K.local_scalar("uint32")
             K.ptx.ld.shared.u32(tcol, tmem_mailbox.ptr_to([0]))

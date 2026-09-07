@@ -586,8 +586,7 @@ def get_kernel(**config):
         and int(config.get("mask_nfunc", 1)) == 19
     )
     fixed_task_major = p20_all_partial or p16_causal_closed_plan or fixed_gqa_task_major
-    load_regs = 88
-    mma_regs = load_regs
+    producer_regs = 88
     compute_regs = 144 if p20_all_partial else (128 if p26_task_major_2d else 136)
     reduce_regs = 136 if p20_all_partial else (168 if p26_task_major_2d else 152)
 
@@ -1004,21 +1003,20 @@ def get_kernel(**config):
         smem_base = K.local_scalar("uint32")
         K.assign(smem_base, K.cuda.cvta_generic_to_shared(arena.ptr_to([0])))
         sp = K.specialize(chain_dispatch=True)
-        r_empty = sp.role("empty", warps=[15])
-        r_relay = sp.role("relay", warps=[14])
-        r_load = sp.role("load", warps=[13])
-        r_mma = sp.role("mma", warps=[12])
-        r_compute = sp.role("compute", warps=list(range(4, 12)))
-        r_reduce = sp.role("reduce", warps=list(range(4)))
+        r_empty = sp.role("empty", warps=[15], regs=producer_regs)
+        r_relay = sp.role("relay", warps=[14], regs=producer_regs)
+        r_load = sp.role("load", warps=[13], regs=producer_regs)
+        r_mma = sp.role("mma", warps=[12], regs=producer_regs)
+        r_compute = sp.role("compute", warps=list(range(4, 12)), regs=compute_regs)
+        r_reduce = sp.role("reduce", warps=list(range(4)), regs=reduce_regs)
 
         with r_empty:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(24))
+            pass
 
         with r_relay:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(24))
+            pass
 
         with r_load:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(load_regs))
             leader = K.local_scalar("uint32", init=K.cuda.elect_sync())
             q_prod = K.PipelineState(2, phase=0)
             do_prod = K.PipelineState(1, phase=0)
@@ -1141,7 +1139,6 @@ def get_kernel(**config):
                 sum_pipe.empty.wait(do_prod.stage, do_prod.phase ^ 1)
 
         with r_mma:
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(K.uint32(mma_regs))
             K.ptx[TMEM_ALLOC](
                 K.cuda.cvta_generic_to_shared(tmem_mailbox.ptr_to([0])), K.uint32(TMEM_COLUMNS)
             )
@@ -1299,7 +1296,6 @@ def get_kernel(**config):
             K.ptx.bar.sync(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
             K.ptx[TMEM_DEALLOC](tcol, K.uint32(TMEM_COLUMNS))
         with r_compute:
-            K.ptx.setmaxnreg.inc.sync.aligned.u32(K.uint32(compute_regs))
             K.ptx.bar.sync(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
             tcol = K.local_scalar("uint32")
             K.ptx.ld.shared.b32(tcol, tmem_mailbox.ptr_to([0]))
@@ -1723,7 +1719,6 @@ def get_kernel(**config):
                                 )
             K.ptx.bar.arrive(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
         with r_reduce:
-            K.ptx.setmaxnreg.inc.sync.aligned.u32(K.uint32(reduce_regs))
             K.ptx.bar.sync(K.uint32(BAR_TMEM[0]), K.uint32(BAR_TMEM[1]))
             tcol = K.local_scalar("uint32")
             K.ptx.ld.shared.b32(tcol, tmem_mailbox.ptr_to([0]))

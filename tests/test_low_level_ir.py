@@ -119,6 +119,23 @@ def test_fp8_msa_decode_satisfies_the_default_ir_contract():
     assert check_low_level_ir(kernel).ok
 
 
+@pytest.mark.parametrize("deterministic,num_q_heads", [(False, 1), (True, 1), (False, 2)])
+def test_flex_backward_cooperative_register_roles_are_valid(deterministic, num_q_heads):
+    from tirx_kernels.registry import load_kernel
+
+    module = load_kernel("cudnn_sm100_flex_attention_backward")
+    config = module._config(
+        "register-contract",
+        seqlen_q=128,
+        seqlen_kv=256,
+        num_q_heads=num_q_heads,
+        num_kv_heads=1,
+        deterministic=deterministic,
+    )
+    config.pop("label")
+    assert check_low_level_ir(module.get_kernel(**config)).ok
+
+
 def test_correctness_runner_does_not_rebuild_an_already_checked_kernel():
     class KernelModule:
         @staticmethod

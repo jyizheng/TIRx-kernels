@@ -441,11 +441,12 @@ def run_gpu(prepared, *, warmup=None, repeat=None, timer=None, rounds=1, cooldow
     """Validate once, then time only matching source/TIRx direct main kernels."""
     import torch
 
-    from tirx_kernels.runner import bench, external_references_enabled
+    from tirx_kernels.runner import bench, defer_gpu_interrupts, external_references_enabled
 
     config = {**prepared["config"], **kwargs}
     kernel_config = {key: value for key, value in config.items() if key != "label"}
-    data = prepare_data(**kernel_config)
+    with defer_gpu_interrupts():
+        data = prepare_data(**kernel_config)
 
     validation_launch = _data.target_launch(prepared["executable"], data)
     # Mask planning, preprocessing, and the source forward run through

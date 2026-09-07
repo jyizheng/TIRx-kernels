@@ -710,12 +710,6 @@ def _make_kernel(**config):
         K.ptx.fence.mbarrier_init.release.cluster()
         if cta_group == 2:
             K.ptx.barrier.cluster.arrive.relaxed()
-        # The source scheduler warp returns its registers before the pipeline
-        # init wait.  Delaying this transition can deadlock WG0's 240-register
-        # acquisition in the two-CTA launch.
-        with K.If(warp == 10), K.Then():
-            K.ptx.setmaxnreg.dec.sync.aligned.u32(72)
-        if cta_group == 2:
             K.ptx.barrier.cluster.wait()
         else:
             K.cuda.cta_sync()
@@ -1139,7 +1133,7 @@ def _make_kernel(**config):
             K.ptx.bar.sync(K.uint32(1), K.uint32(288))
             tmem_base = K.local_scalar("uint32")
             K.ptx.ld.shared.u32(tmem_base, tmem_mailbox.ptr_to([0]))
-            row_hi = K.shift_left(K.cast(tid128, "uint32"), K.uint32(16))
+            row_hi = K.shift_left(K.cast((warp % 4) * 32, "uint32"), K.uint32(16))
             score_stage = K.local_scalar("int32", init=0)
             score_phase = K.local_scalar("int32", init=0)
             p_stage = K.local_scalar("int32", init=0)
@@ -1304,7 +1298,7 @@ def _make_kernel(**config):
             K.ptx.bar.sync(K.uint32(1), K.uint32(288))
             tmem_base = K.local_scalar("uint32")
             K.ptx.ld.shared.u32(tmem_base, tmem_mailbox.ptr_to([0]))
-            row_hi = K.shift_left(K.cast(tid128, "uint32"), K.uint32(16))
+            row_hi = K.shift_left(K.cast((warp % 4) * 32, "uint32"), K.uint32(16))
             stats_stage = K.local_scalar("int32", init=0)
             stats_phase = K.local_scalar("int32", init=0)
             o_phase = K.local_scalar("int32", init=0)
@@ -2169,7 +2163,7 @@ def _compile_tirx(config):
     previous = os.environ.get(name)
     os.environ[name] = str(_ptxas_register_usage_level(config))
     try:
-        return compile_kernel(get_kernel(**config), arch="sm_103a")
+        return compile_kernel(get_kernel(**config))
     finally:
         if previous is None:
             os.environ.pop(name, None)
