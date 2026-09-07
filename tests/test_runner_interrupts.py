@@ -64,3 +64,20 @@ def test_quiet_critical_section_does_not_redeliver(bench_child_handler):
     # and a later signal still raises immediately.
     with pytest.raises(_Interrupted):
         os.kill(os.getpid(), signal.SIGUSR1)
+
+
+def test_flex_backward_defers_interrupt_during_reference_preparation(
+    bench_child_handler, monkeypatch
+):
+    from tirx_kernels.cudnn.flex_attention import flex_attention_backward_sm100 as flex
+
+    survived = []
+
+    def prepare_data(**config):
+        os.kill(os.getpid(), signal.SIGUSR1)
+        survived.append("reference preparation completed")
+
+    monkeypatch.setattr(flex, "prepare_data", prepare_data)
+    with pytest.raises(_Interrupted):
+        flex.run_gpu({"config": {}})
+    assert survived == ["reference preparation completed"]
