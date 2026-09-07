@@ -523,6 +523,22 @@ Grouped workloads show one row per config and one timing column per implementati
 
 ## Jetson AGX Thor (`sm_110a`)
 
+### fast_topk_clusters
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `f32_plain_b16_l4096_k256` | tirx | 10.9391 | flashinfer | 11.1809 | 1.022 | — |
+| `f32_plain_b64_l16384_k256` | tirx | 67.7273 | flashinfer | 192.1225 | 2.837 | — |
+| `f32_plain_b64_l65536_k1024` | tirx | 226.0682 | flashinfer | 304.5217 | 1.347 | — |
+
+### filtered_topk
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `f32_plain_det_r2_l524288_k256_endbit` | tirx | 143.5166 | flashinfer | 162.3314 | 1.131 | — |
+| `f32_plain_r4_l8192_k256` | tirx | 10.4883 | flashinfer | 12.1341 | 1.157 | — |
+| `f32_plain_r64_l8192_k256` | tirx | 39.3581 | flashinfer | 45.6034 | 1.159 | — |
+
 ### flash_attention4
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |

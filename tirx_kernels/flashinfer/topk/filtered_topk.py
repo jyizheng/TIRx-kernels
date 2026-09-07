@@ -53,7 +53,8 @@ SM100 cluster kernel, which the ``FLASHINFER_TOPK_ALGO=filtered`` pin keeps out 
 the reference path.
 """
 
-from contextlib import nullcontext
+import os
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import tirx_kernels.kern as K
@@ -94,7 +95,7 @@ from tirx_kernels.flashinfer.utils.topk_radix import (
     st_global_u16,
     st_global_u32,
 )
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV, bench
 
 # Patterns whose whole purpose is to overflow the candidate arena; prepare_data
 # asserts on the host that they still do.
@@ -106,7 +107,7 @@ _OVERFLOW_LENGTH = 131072
 KERNEL_META = {
     "name": "filtered_topk",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -272,6 +273,40 @@ def _validate(
 # ---------------------------------------------------------------------------
 # Target entries.
 # ---------------------------------------------------------------------------
+def _select_ptxas_reg_level(
+    num_rows: int, length: int, k: int, deterministic: bool, tie_break: int
+) -> str:
+    if (num_rows, length, k, deterministic, tie_break) == (4, 8192, 256, False, TIE_NONE):
+        return "6"
+    if (num_rows, length, k, deterministic, tie_break) == (2, 524288, 256, True, TIE_NONE):
+        return "5"
+    return "10"
+
+
+@contextmanager
+def _thor_ptxas_reg_level(config: dict[str, Any]):
+    """Scope Thor's measured compiler setting to this module's compilation."""
+    if os.environ.get(PREPARE_CUDA_ARCH_ENV, "sm_100a") != "sm_110a":
+        yield
+        return
+    name = "TVM_CUDA_PTXAS_REG_LEVEL"
+    previous = os.environ.get(name)
+    os.environ[name] = _select_ptxas_reg_level(
+        config["num_rows"],
+        config["length"],
+        config["k"],
+        config["deterministic"],
+        config["tie_break"],
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
 def get_kernel(
     dtype: str = "float32",
     mode: str = "basic",
@@ -996,10 +1031,11 @@ def run_test(**config):
     assert_reference_is_top_k(cfg, data, ref_out)
     assert_reference_tie_break(cfg, data, ref_out)
 
-    kernel = get_kernel(**cfg)
-    finalize = get_finalize_kernel(**cfg)
-    ex = compile_kernel(kernel)
-    ex_finalize = compile_kernel(finalize) if finalize is not None else None
+    with _thor_ptxas_reg_level(cfg):
+        kernel = get_kernel(**cfg)
+        finalize = get_finalize_kernel(**cfg)
+        ex = compile_kernel(kernel)
+        ex_finalize = compile_kernel(finalize) if finalize is not None else None
 
     tirx_out = alloc_outputs(cfg)
     _launch_tirx(ex, ex_finalize, build_tirx_args(cfg, data, tirx_out))
@@ -1159,13 +1195,14 @@ def prepare_bench(**kwargs: Any):
     from tirx_kernels.runner import compile_kernel, prepared_gpu_benchmark
 
     cfg = _normalize_config(kwargs)
-    finalize = get_finalize_kernel(**cfg)
-    state = {
-        "config": cfg,
-        "executable": compile_kernel(get_kernel(**cfg)),
-        # None where `finalize_plan` says the dispatcher issues no second launch.
-        "finalize": compile_kernel(finalize) if finalize is not None else None,
-    }
+    with _thor_ptxas_reg_level(cfg):
+        finalize = get_finalize_kernel(**cfg)
+        state = {
+            "config": cfg,
+            "executable": compile_kernel(get_kernel(**cfg)),
+            # None where `finalize_plan` says the dispatcher issues no second launch.
+            "finalize": compile_kernel(finalize) if finalize is not None else None,
+        }
     return prepared_gpu_benchmark(run_gpu, state)
 
 
