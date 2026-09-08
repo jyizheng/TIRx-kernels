@@ -20,7 +20,7 @@ keeps them in sync.
 | `sm_100a` | 103 |
 | `sm_103a` | 98 |
 | `sm_107a` | 94 |
-| `sm_110a` | 10 |
+| `sm_110a` | 12 |
 
 ### Native TIRx
 
@@ -97,7 +97,7 @@ Grouped by the FlashInfer Python entry point each port backs.
 - **`flashinfer.quantization`:**
   [`nvfp4_quantize`](tirx_kernels/flashinfer/quantization/nvfp4_quantize.py),
   [`nvfp4_quantize_per_token`](tirx_kernels/flashinfer/quantization/nvfp4_quantize_per_token.py),
-  [`mxfp4_quantize`](tirx_kernels/flashinfer/quantization/mxfp4_quantize.py),
+  [`mxfp4_quantize`](tirx_kernels/flashinfer/quantization/mxfp4_quantize.py) ⟨+sm_110a⟩,
   [`mxfp8_quantize`](tirx_kernels/flashinfer/quantization/mxfp8_quantize.py)
 - **`flashinfer.norm`:**
   [`flashinfer_rmsnorm`](tirx_kernels/flashinfer/norm/rmsnorm.py) ⟨+sm_110a⟩,
@@ -115,7 +115,7 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`selective_state_update_stp_horizontal`](tirx_kernels/flashinfer/mamba/selective_state_update_stp_horizontal.py),
   [`selective_state_update_mtp_simple`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_simple.py) ⟨+sm_110a⟩,
   [`selective_state_update_mtp_vertical`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_vertical.py) ⟨+sm_110a⟩,
-  [`selective_state_update_mtp_horizontal`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_horizontal.py)
+  [`selective_state_update_mtp_horizontal`](tirx_kernels/flashinfer/mamba/selective_state_update_mtp_horizontal.py) ⟨+sm_110a⟩
 - **`flashinfer.kda`:**
   [`flashkda_bf16_fused_m128`](tirx_kernels/flashinfer/kda/bf16_fused_m128.py),
   [`recurrent_kda_decode_one_warp`](tirx_kernels/flashinfer/kda/recurrent_kda_decode_one_warp.py),

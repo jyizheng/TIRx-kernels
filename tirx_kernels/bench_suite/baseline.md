@@ -587,6 +587,14 @@ Grouped workloads show one row per config and one timing column per implementati
 | `decode_b64_k16384_h4_varlen` | tirx | 3136.1864 | msa | 3995.1724 | 1.274 | — |
 | `prefill_b1_k8192_h2` | tirx | 5.7109 | msa | 6.2449 | 1.094 | — |
 
+### mxfp4_quantize
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `fp16_128x4_m128_k1024` | tirx | 6.7874 | flashinfer | 6.9652 | 1.026 | — |
+| `fp16_128x4_m16384_k7168` | tirx | 1936.2057 | flashinfer | 1948.9107 | 1.007 | — |
+| `fp16_linear_m4096_k4096` | tirx | 344.2575 | flashinfer | 353.9275 | 1.028 | — |
+
 ### selective_state_update_mtp_simple
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
@@ -602,3 +610,11 @@ Grouped workloads show one row per config and one timing column per implementati
 | `b1_h64_d64_s128_t6_r8_statebf16_official` | tirx | 47.7000 | flashinfer_cuda | 50.0233 | 1.049 | — |
 | `b2048_h64_d64_s128_t6_r8_statebf16_official` | tirx | 25012.4818 | flashinfer_cuda | 26609.4659 | 1.064 | — |
 | `b512_h64_d64_s128_t6_r8_statebf16_official` | tirx | 6220.0814 | flashinfer_cuda | 6629.1134 | 1.066 | — |
+
+### selective_state_update_mtp_horizontal
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `b1_h64_d64_s128_t6_r8_statebf16_official` | tirx | 26.0536 | flashinfer_cuda | 29.3040 | 1.125 | — |
+| `b2048_h64_d64_s128_t6_r8_statebf16_official` | tirx | 14069.8720 | flashinfer_cuda | 15273.7740 | 1.086 | — |
+| `b512_h64_d64_s128_t6_r8_statebf16_official` | tirx | 3537.5044 | flashinfer_cuda | 3875.5075 | 1.096 | — |
