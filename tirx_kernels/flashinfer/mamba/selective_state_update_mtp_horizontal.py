@@ -50,11 +50,11 @@ _bf16_word_to_f32x2 = _simple._bf16_word_to_f32x2
 _philox4x32 = _vertical._philox4x32
 
 
-def _mbarrier_arrive_wait_parity(barrier, parity, *, zero_sleep=False):
+def _mbarrier_arrive_wait_parity(barrier, parity, *, yield_while_waiting=False):
     K.ptx.mbarrier.arrive.shared__cta.b64(barrier)
     ready = K.local_scalar("uint32", init=K.uint32(0))
     with K.While(True):
-        if zero_sleep:
+        if yield_while_waiting:
             K.cuda.nano_sleep(0)
         K.ptx.mbarrier.try_wait.parity.shared__cta.b64(ready, barrier, K.uint32(parity))
         with K.If(ready != K.uint32(0)), K.Then():
@@ -589,7 +589,9 @@ def get_kernel(**kwargs: Any):
             and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
         )
     )
-    use_zero_sleep_wait = thor_bf16_shape and (
+    # A zero-duration nanosleep yields the polling warp so the producer can
+    # advance on the Thor shapes where the mbarrier handoff is latency-bound.
+    use_wait_yield = thor_bf16_shape and (
         (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP)
         in (
             (64, 128, 128, 4, 8),
@@ -851,7 +853,7 @@ def get_kernel(**kwargs: Any):
                 _mbarrier_arrive_wait_parity(
                     full_barriers.ptr_to([state_pipe.stage]),
                     state_pipe.phase,
-                    zero_sleep=use_zero_sleep_wait,
+                    yield_while_waiting=use_wait_yield,
                 )
 
                 with K.serial(2) as sp:
@@ -1114,7 +1116,7 @@ def get_kernel(**kwargs: Any):
                 state_pipe.advance()
 
             _mbarrier_arrive_wait_parity(
-                out_ready_barrier.ptr_to([0]), 0, zero_sleep=use_zero_sleep_wait
+                out_ready_barrier.ptr_to([0]), 0, yield_while_waiting=use_wait_yield
             )
             with K.unroll((NTOKENS + 3) // 4) as episode:
                 step: K.int32 = compute_warp + episode * 4
@@ -1238,7 +1240,7 @@ def get_kernel(**kwargs: Any):
                 _mbarrier_arrive_wait_parity(
                     empty_barriers.ptr_to([state_pipe.stage]),
                     state_pipe.phase,
-                    zero_sleep=use_zero_sleep_wait,
+                    yield_while_waiting=use_wait_yield,
                 )
                 with K.If(lane == 0), K.Then():
                     if not IS_PAD:
