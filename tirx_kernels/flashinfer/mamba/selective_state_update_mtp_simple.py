@@ -416,8 +416,10 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
     total_tiles = max(batch * nheads, 1)
     requested_ctas = max(1, min(target_ctas // total_tiles, dim // 16))
     ctas_per_head = 4 if requested_ctas >= 4 else 2 if requested_ctas >= 2 else 1
+    if "_ctas_per_head" in config:
+        ctas_per_head = int(config["_ctas_per_head"])
     dim_per_cta = dim // ctas_per_head
-    if dim % ctas_per_head or dim_per_cta % 16:
+    if ctas_per_head not in (1, 2, 4) or dim % ctas_per_head or dim_per_cta % 16:
         raise ValueError("MTP simple requires DIM_PER_CTA to be a multiple of 16")
     num_passes = dim_per_cta // 16
     state_stages = 1 if num_passes == 1 else 2
@@ -446,6 +448,7 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
         "ELEMS_PER_TILE": elems_per_tile,
         "NUM_TILES": num_tiles,
         "HAS_STATE_INDICES": bool(config.get("has_state_indices", True)),
+        "ASSUME_NO_PAD": bool(config.get("_assume_no_pad", False)),
         "HAS_DST_INDICES": bool(config.get("has_dst_indices", False)),
         "HAS_INTERMEDIATE_STATES": bool(config.get("has_intermediate_states", False)),
         "HAS_INTERMEDIATE_INDICES": bool(config.get("has_intermediate_states", False)),
@@ -454,6 +457,8 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
         "HAS_Z": bool(config.get("has_z", False)),
         "HAS_D": bool(config.get("has_d", True)),
         "HAS_DT_BIAS": bool(config.get("has_dt_bias", True)),
+        "DT_SOFTPLUS": bool(config.get("dt_softplus", True)),
+        "UPDATE_STATE": bool(config.get("update_state", True)),
         "SCALE_STATE": scale_state,
         "PHILOX_ROUNDS": philox_rounds,
         # K allocates s_out immediately after a 128-byte-aligned x tile and
@@ -484,13 +489,17 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
 def get_kernel(**kwargs: Any):
     """Build the K entry for one MTP simple specialization."""
     spec = _specialization(kwargs)
+    schedule_heads_first = bool(kwargs.get("_schedule_heads_first", False))
+    min_blocks_per_sm = int(kwargs.get("_min_blocks_per_sm", 0))
 
     ACCEPTED_DTYPE = spec["ACCEPTED_DTYPE"]
+    ASSUME_NO_PAD = spec["ASSUME_NO_PAD"]
     CU_SEQLENS_DTYPE = spec["CU_SEQLENS_DTYPE"]
     DIM = spec["DIM"]
     DIM_PER_CTA = spec["DIM_PER_CTA"]
     DSTATE = spec["DSTATE"]
     DSTATE_PAD = spec["DSTATE_PAD"]
+    DT_SOFTPLUS = spec["DT_SOFTPLUS"]
     ELEMS_PER_TILE = spec["ELEMS_PER_TILE"]
     ELEMS_PER_TILE_MEMBER = spec["ELEMS_PER_TILE_MEMBER"]
     HAS_CU_SEQLENS = spec["HAS_CU_SEQLENS"]
@@ -515,9 +524,22 @@ def get_kernel(**kwargs: Any):
     STATE_BYTES = spec["STATE_BYTES"]
     STATE_DTYPE = spec["STATE_DTYPE"]
     STATE_STAGES = spec["STATE_STAGES"]
+    UPDATE_STATE = spec["UPDATE_STATE"]
     WEIGHT_DTYPE = spec["WEIGHT_DTYPE"]
 
-    @K.kernel(warps=4, arch="sm_100a", grid=(spec["BATCH"], spec["NHEADS"], spec["CTAS_PER_HEAD"]))
+    kernel_options = {
+        "warps": 4,
+        "arch": "sm_100a",
+        "grid": (
+            (spec["NHEADS"], spec["BATCH"], spec["CTAS_PER_HEAD"])
+            if schedule_heads_first
+            else (spec["BATCH"], spec["NHEADS"], spec["CTAS_PER_HEAD"])
+        ),
+    }
+    if min_blocks_per_sm:
+        kernel_options["min_blocks_per_sm"] = min_blocks_per_sm
+
+    @K.kernel(**kernel_options)
     def selective_state_update_mtp_simple(
         state: K.gptr[spec["STATE_DTYPE"]],
         state_scale: K.gptr[K.f32],
@@ -563,7 +585,11 @@ def get_kernel(**kwargs: Any):
         update_state: K.i32,
         pad_slot_id: K.i32,
     ):
-        seq_idx, head, cta_z = K.cta_id()
+        cta_x, cta_y, cta_z = K.cta_id()
+        if schedule_heads_first:
+            head, seq_idx = cta_x, cta_y
+        else:
+            seq_idx, head = cta_x, cta_y
         smem = K.smem_pool()
         s_b = smem.alloc((spec["NTOKENS"] * spec["DSTATE_PAD"],), K.bf16, align=128)
         s_c = smem.alloc((spec["NTOKENS"] * spec["DSTATE_PAD"],), K.bf16, align=128)
@@ -586,6 +612,7 @@ def get_kernel(**kwargs: Any):
         kv_group = head // HEADS_PER_GROUP
         bos = K.local_scalar("int32")
         seq_len = K.local_scalar("int32")
+        active_seq_len = seq_len if HAS_CU_SEQLENS else NTOKENS
         is_pad = K.local_scalar("int32")
         state_ptr_offset_i32 = K.local_scalar("int32")
         state_batch = K.local_scalar("int64")
@@ -636,7 +663,10 @@ def get_kernel(**kwargs: Any):
                 )
             else:
                 K.assign(state_batch, K.cast(seq_idx, "int64"))
-            K.assign(is_pad, K.if_then_else(state_batch != K.cast(pad_slot_id, "int64"), 0, 1))
+            if ASSUME_NO_PAD:
+                K.assign(is_pad, 0)
+            else:
+                K.assign(is_pad, K.if_then_else(state_batch != K.cast(pad_slot_id, "int64"), 0, 1))
             K.assign(
                 state_head_offset,
                 state_batch * state_stride_batch + K.cast(head * DIM * DSTATE, "int64"),
@@ -675,7 +705,7 @@ def get_kernel(**kwargs: Any):
                 with K.If(packed_i < NTOKENS * DSTATE // 8), K.Then():
                     step: K.int32 = packed_i // (DSTATE // 8)
                     col: K.int32 = packed_i % (DSTATE // 8) * 8
-                    with K.If(step < seq_len), K.Then():
+                    with K.If(step < active_seq_len), K.Then():
                         K.ptx["cp.async.cg.shared.global"](
                             s_dst.ptr_to([step * DSTATE_PAD + col]),
                             src.ptr_to(
@@ -710,7 +740,7 @@ def get_kernel(**kwargs: Any):
         def update_sequence(IS_PAD: K.constexpr):
             with K.serial((NTOKENS + 3) // 4) as step_iter:
                 step: K.int32 = warp + step_iter * 4
-                with K.If(step < seq_len), K.Then():
+                with K.If(step < active_seq_len), K.Then():
                     with K.serial((DIM_PER_CTA // 8 + 31) // 32) as col_iter:
                         col: K.int32 = (lane + col_iter * 32) * 8
                         with K.If(col < DIM_PER_CTA), K.Then():
@@ -746,7 +776,7 @@ def get_kernel(**kwargs: Any):
                             16,
                         )
 
-            with K.If(flat_tid < seq_len), K.Then():
+            with K.If(flat_tid < active_seq_len), K.Then():
                 dt_value = K.local_scalar("float32")
                 K.assign(
                     dt_value,
@@ -758,7 +788,7 @@ def get_kernel(**kwargs: Any):
                     K.ptx["add.ftz.f32"](
                         dt_value, dt_value, _load_weight(dt_bias, head, WEIGHT_DTYPE)
                     )
-                with K.If(dt_softplus != 0), K.Then():
+                if DT_SOFTPLUS:
                     with K.If(dt_value <= K.float32(20.0)), K.Then():
                         mul_2 = K.local_scalar("float32")
                         K.ptx["mul.ftz.f32"](mul_2, dt_value, K.float32(_LOG2_E))
@@ -775,7 +805,7 @@ def get_kernel(**kwargs: Any):
             with K.If(flat_tid < NTOKENS), K.Then():
                 step: K.int32 = flat_tid
                 dst_slot = K.local_scalar("int64", init=-1)
-                with K.If(K.And(K.Not(IS_PAD), step < seq_len)), K.Then():
+                with K.If(K.And(K.Not(IS_PAD), step < active_seq_len)), K.Then():
                     if HAS_DST_INDICES:
                         dst_index: K.int64 = _global_load_index_s64(
                             dst_indices,
@@ -795,8 +825,8 @@ def get_kernel(**kwargs: Any):
                         K.assign(
                             dst_slot, (intermediate_index * K.cast(cache_steps, "int64") + step)
                         )
-                    else:
-                        with K.If(K.And(step == seq_len - 1, update_state != 0)), K.Then():
+                    elif UPDATE_STATE:
+                        with K.If(step == active_seq_len - 1), K.Then():
                             K.assign(dst_slot, state_batch)
                 K.ptx.st.shared.b64(s_dst_slots.ptr_to([step]), dst_slot)
 
@@ -911,7 +941,7 @@ def get_kernel(**kwargs: Any):
                 dt_step = K.local_scalar("int32", init=0)
                 out_step = K.local_scalar("int32", init=0)
                 with K.serial(NTOKENS) as step:
-                    with K.If(step < seq_len), K.Then():
+                    with K.If(step < active_seq_len), K.Then():
                         dst_slot = K.local_scalar("int64")
                         K.ptx.ld.shared.b64(dst_slot, s_dst_slots.ptr_to([step]))
                         dt_value = K.local_scalar("float32")
@@ -1343,7 +1373,7 @@ def get_kernel(**kwargs: Any):
             K.ptx.bar.sync(K.uint32(0))
             with K.serial((NTOKENS + 3) // 4) as output_iter:
                 step: K.int32 = warp + output_iter * 4
-                with K.If(step < seq_len), K.Then():
+                with K.If(step < active_seq_len), K.Then():
                     out_base = K.local_scalar("int64")
                     z_base = K.local_scalar("int64")
                     if HAS_CU_SEQLENS:
@@ -1482,18 +1512,27 @@ def get_kernel(**kwargs: Any):
                             output_bit: K.uint16 = f32_bf16_2
                             K.ptx.st.global_.b16(output.ptr_to([out_base + lane]), output_bit)
 
-        prepare_sequence()
-        with K.If(seq_len > 0), K.Then():
+        def run_active_sequence():
             prepare_active_sequence()
             with load_b:
                 load_bc_values(s_b, matrix_b, b_base, b_tstride)
             with load_c:
                 load_bc_values(s_c, matrix_c, c_base, c_tstride)
-            with K.If(is_pad != 0):
-                with K.Then():
-                    update_sequence(True)
-                with K.Else():
-                    update_sequence(False)
+            if ASSUME_NO_PAD:
+                update_sequence(False)
+            else:
+                with K.If(is_pad != 0):
+                    with K.Then():
+                        update_sequence(True)
+                    with K.Else():
+                        update_sequence(False)
+
+        prepare_sequence()
+        if HAS_CU_SEQLENS:
+            with K.If(seq_len > 0), K.Then():
+                run_active_sequence()
+        else:
+            run_active_sequence()
 
     return selective_state_update_mtp_simple.func
 

@@ -10,11 +10,14 @@ Upstream source: include/flashinfer/mamba/kernel_selective_state_update_mtp_hori
 
 import ctypes
 import functools
+import os
 from typing import Any
 
 import torch
 
 import tirx_kernels.kern as K
+from tirx_kernels.runner import PREPARE_CUDA_ARCH_ENV
+from tvm.ir import PointerType, PrimType
 
 from . import selective_state_update_mtp_simple as _simple
 from . import selective_state_update_mtp_vertical as _vertical
@@ -23,7 +26,7 @@ from .selective_state_update_mtp_simple import _case, _shfl_down_f32
 KERNEL_META = {
     "name": "selective_state_update_mtp_horizontal",
     "category": "flashinfer",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_110a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -47,10 +50,12 @@ _bf16_word_to_f32x2 = _simple._bf16_word_to_f32x2
 _philox4x32 = _vertical._philox4x32
 
 
-def _mbarrier_arrive_wait_parity(barrier, parity):
+def _mbarrier_arrive_wait_parity(barrier, parity, *, zero_sleep=False):
     K.ptx.mbarrier.arrive.shared__cta.b64(barrier)
     ready = K.local_scalar("uint32", init=K.uint32(0))
     with K.While(True):
+        if zero_sleep:
+            K.cuda.nano_sleep(0)
         K.ptx.mbarrier.try_wait.parity.shared__cta.b64(ready, barrier, K.uint32(parity))
         with K.If(ready != K.uint32(0)), K.Then():
             K.Break()
@@ -73,8 +78,7 @@ def _store_state_tile(
     pair_base,
     random_words,
     random_base,
-    destination,
-    destination_base,
+    destination_ptr,
     *,
     STATE_DTYPE,
     PAIRS_PER_TILE_MEMBER,
@@ -86,25 +90,19 @@ def _store_state_tile(
             packed = values[pair_base + pair]
             K.ptx.mov.b32(words[pair * 2], K.reinterpret("uint32", K.cuda.float2_x(packed)))
             K.ptx.mov.b32(words[pair * 2 + 1], K.reinterpret("uint32", K.cuda.float2_y(packed)))
-        K.ptx.st.global_.v4.b32(
-            destination.ptr_to([destination_base]), words[0], words[1], words[2], words[3]
-        )
+        K.ptx.st.global_.v4.b32(destination_ptr, words[0], words[1], words[2], words[3])
     elif PHILOX_ROUNDS > 0:
         packed_words = K.alloc_local((4,), "uint32")
         with K.unroll(4) as pair:
             packed = values[pair_base + pair]
-            K.ptx.cvt.rs.f16x2.f32(
+            _simple._cvt_rs_f16x2_f32(
                 packed_words[pair],
                 K.cuda.float2_y(packed),
                 K.cuda.float2_x(packed),
                 random_words[random_base + pair // 2 * 4 + pair % 2],
             )
         K.ptx.st.global_.v4.b32(
-            destination.ptr_to([destination_base]),
-            packed_words[0],
-            packed_words[1],
-            packed_words[2],
-            packed_words[3],
+            destination_ptr, packed_words[0], packed_words[1], packed_words[2], packed_words[3]
         )
     else:
         bits = K.alloc_local((8,), "uint16")
@@ -127,9 +125,7 @@ def _store_state_tile(
                 K.ptx.mov.b16(bits[pair * 2 + 1], f32_f16_1)
         with K.unroll(4) as word:
             K.ptx.mov.b32(words[word], bits[word * 2], bits[word * 2 + 1])
-        K.ptx.st.global_.v4.b32(
-            destination.ptr_to([destination_base]), words[0], words[1], words[2], words[3]
-        )
+        K.ptx.st.global_.v4.b32(destination_ptr, words[0], words[1], words[2], words[3])
 
 
 BENCH_CONFIGS = [
@@ -275,6 +271,7 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
         "ELEMS_PER_TILE": elems_per_tile,
         "NUM_TILES": num_tiles,
         "HAS_STATE_INDICES": bool(config.get("has_state_indices", True)),
+        "HAS_DST_INDICES": bool(config.get("has_dst_indices", False)),
         "HAS_INTERMEDIATE_STATES": bool(config.get("has_intermediate_states", False)),
         "HAS_Z": bool(config.get("has_z", False)),
         "HAS_D": bool(config.get("has_d", True)),
@@ -294,8 +291,264 @@ def _specialization(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _use_simple_dispatch(spec: dict[str, Any], arch: str) -> bool:
+    if not arch.startswith("sm_110") or spec["HAS_DST_INDICES"]:
+        return False
+    shape = (
+        spec["BATCH"],
+        spec["NHEADS"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    )
+    return (
+        shape == (1, 64, 64, 128, 6, 8, "bfloat16")
+        or (
+            shape in ((2, 64, 64, 128, 6, 8, "bfloat16"), (128, 64, 64, 128, 6, 8, "bfloat16"))
+            and not spec["UPDATE_STATE"]
+        )
+        or (
+            shape
+            in (
+                (1, 64, 64, 128, 6, 8, "float32"),
+                (2, 64, 64, 128, 6, 8, "float32"),
+                (4, 64, 64, 128, 6, 8, "float32"),
+            )
+            and not spec["UPDATE_STATE"]
+        )
+        or (
+            spec["BATCH"],
+            spec["NHEADS"],
+            spec["DIM"],
+            spec["DSTATE"],
+            spec["NTOKENS"],
+            spec["HEADS_PER_GROUP"],
+            spec["STATE_DTYPE"],
+            spec["WEIGHT_DTYPE"],
+        )
+        == (64, 64, 64, 128, 4, 8, "bfloat16", "bfloat16")
+        or (
+            spec["BATCH"],
+            spec["NHEADS"],
+            spec["DIM"],
+            spec["DSTATE"],
+            spec["NTOKENS"],
+            spec["HEADS_PER_GROUP"],
+            spec["STATE_DTYPE"],
+        )
+        in (
+            (64, 64, 128, 128, 4, 8, "bfloat16"),
+            (64, 64, 64, 128, 4, 8, "bfloat16"),
+            (64, 64, 64, 128, 2, 8, "bfloat16"),
+            (64, 64, 64, 128, 8, 8, "bfloat16"),
+            (64, 64, 64, 128, 4, 1, "bfloat16"),
+            (64, 64, 64, 96, 4, 8, "bfloat16"),
+            (64, 64, 64, 64, 4, 8, "bfloat16"),
+        )
+        or (shape == (64, 64, 64, 128, 4, 8, "float16") and spec["PHILOX_ROUNDS"] == 0)
+        or (
+            (spec["INDEX_DTYPE"] == "int32" or spec["HAS_INTERMEDIATE_STATES"])
+            and (
+                spec["BATCH"],
+                spec["NHEADS"],
+                spec["DIM"],
+                spec["DSTATE"],
+                spec["NTOKENS"],
+                spec["HEADS_PER_GROUP"],
+                spec["STATE_DTYPE"],
+            )
+            == (64, 64, 64, 128, 4, 8, "bfloat16")
+        )
+    )
+
+
+def _simple_ptxas_level(spec: dict[str, Any], arch: str) -> str | None:
+    if not arch.startswith("sm_110"):
+        return None
+    shape = (
+        spec["BATCH"],
+        spec["NHEADS"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    )
+    if shape == (64, 64, 64, 128, 8, 8, "bfloat16"):
+        return "5"
+    if shape == (64, 64, 64, 128, 4, 1, "bfloat16"):
+        return "2"
+    if shape == (64, 64, 64, 96, 4, 8, "bfloat16"):
+        return "5"
+    if shape == (64, 64, 64, 128, 4, 8, "bfloat16") and spec["HAS_INTERMEDIATE_STATES"]:
+        return "9"
+    if shape == (64, 64, 64, 64, 4, 8, "bfloat16") or (
+        shape == (64, 64, 64, 128, 4, 8, "bfloat16") and spec["INDEX_DTYPE"] == "int32"
+    ):
+        return "7"
+    return None
+
+
+def _simple_min_blocks_per_sm(spec: dict[str, Any], arch: str) -> int | None:
+    if not arch.startswith("sm_110"):
+        return None
+    shape = (
+        spec["BATCH"],
+        spec["NHEADS"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    )
+    if shape == (64, 64, 64, 128, 4, 8, "bfloat16") and spec["HAS_INTERMEDIATE_STATES"]:
+        return 2
+    if shape == (64, 64, 64, 128, 4, 8, "bfloat16") and spec["UPDATE_STATE"]:
+        return 2
+    return None
+
+
+def _ptxas_level(spec: dict[str, Any], arch: str) -> str:
+    ptxas_level = "10"
+    if (
+        arch.startswith("sm_110")
+        and spec["HAS_INTERMEDIATE_STATES"]
+        and (spec["BATCH"], spec["DIM"], spec["DSTATE"], spec["NTOKENS"], spec["HEADS_PER_GROUP"])
+        == (64, 64, 128, 4, 8)
+    ):
+        ptxas_level = "6"
+    elif (
+        arch.startswith("sm_110")
+        and spec["WEIGHT_DTYPE"] == "bfloat16"
+        and (spec["BATCH"], spec["DIM"], spec["DSTATE"], spec["NTOKENS"], spec["HEADS_PER_GROUP"])
+        == (64, 64, 128, 4, 8)
+    ):
+        ptxas_level = "9"
+    elif (
+        arch.startswith("sm_110")
+        and spec["INDEX_DTYPE"] == "int32"
+        and (spec["BATCH"], spec["DIM"], spec["DSTATE"], spec["NTOKENS"], spec["HEADS_PER_GROUP"])
+        == (64, 64, 128, 4, 8)
+    ):
+        ptxas_level = "9"
+    elif (
+        arch.startswith("sm_110")
+        and spec["HAS_Z"]
+        and (spec["BATCH"], spec["DIM"], spec["DSTATE"], spec["NTOKENS"], spec["HEADS_PER_GROUP"])
+        == (64, 64, 128, 4, 8)
+    ):
+        ptxas_level = "8"
+    elif (
+        arch.startswith("sm_110")
+        and spec["STATE_DTYPE"] == "bfloat16"
+        and (spec["BATCH"], spec["DIM"], spec["DSTATE"], spec["NTOKENS"], spec["HEADS_PER_GROUP"])
+        == (64, 64, 64, 4, 8)
+    ):
+        ptxas_level = "9"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    ) == (64, 128, 128, 4, 8, "bfloat16"):
+        ptxas_level = "6"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 8, 8):
+        ptxas_level = "3"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 4, 16):
+        ptxas_level = "2"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 4, 64):
+        ptxas_level = "5"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 4, 1):
+        ptxas_level = "5"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 2, 8):
+        ptxas_level = "4"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+    ) == (64, 64, 128, 1, 8):
+        ptxas_level = "0"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["NHEADS"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    ) == (1, 64, 64, 128, 6, 8, "float32"):
+        ptxas_level = "5"
+    elif arch.startswith("sm_110") and (
+        spec["BATCH"],
+        spec["DIM"],
+        spec["DSTATE"],
+        spec["NTOKENS"],
+        spec["HEADS_PER_GROUP"],
+        spec["STATE_DTYPE"],
+    ) == (64, 64, 128, 4, 8, "bfloat16"):
+        ptxas_level = "0"
+    elif arch.startswith("sm_110") and spec["STATE_DTYPE"] == "float16":
+        ptxas_level = "9"
+    return ptxas_level
+
+
 def get_kernel(**kwargs: Any):
     spec = _specialization(kwargs)
+    arch = os.environ.get(PREPARE_CUDA_ARCH_ENV, "")
+    if _use_simple_dispatch(spec, arch):
+        simple_kwargs = dict(kwargs)
+        simple_kwargs["_assume_no_pad"] = int(kwargs.get("pad_every", 0)) == 0
+        simple_kwargs["_schedule_heads_first"] = spec["BATCH"] >= 64
+        if (
+            spec["BATCH"],
+            spec["NHEADS"],
+            spec["DIM"],
+            spec["DSTATE"],
+            spec["NTOKENS"],
+            spec["HEADS_PER_GROUP"],
+            spec["STATE_DTYPE"],
+        ) == (1, 64, 64, 128, 6, 8, "float32"):
+            simple_kwargs["_ctas_per_head"] = 1
+        min_blocks = _simple_min_blocks_per_sm(spec, arch)
+        if min_blocks is not None:
+            simple_kwargs["_min_blocks_per_sm"] = min_blocks
+        return _simple.get_kernel(**simple_kwargs)
     NHEADS = spec["NHEADS"]
     DIM = spec["DIM"]
     DSTATE = spec["DSTATE"]
@@ -319,8 +572,130 @@ def get_kernel(**kwargs: Any):
     STATE_DTYPE = spec["STATE_DTYPE"]
     WEIGHT_DTYPE = spec["WEIGHT_DTYPE"]
     INDEX_DTYPE = spec["INDEX_DTYPE"]
+    thor_bf16_shape = arch.startswith("sm_110") and STATE_DTYPE == "bfloat16"
+    use_direct_state_index = thor_bf16_shape and (
+        (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP)
+        in ((64, 128, 128, 4, 8), (64, 64, 128, 4, 16), (64, 64, 64, 4, 8))
+        or (
+            INDEX_DTYPE == "int32"
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        )
+    )
+    use_direct_bc_index = thor_bf16_shape and (
+        (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP)
+        in ((64, 128, 128, 4, 8), (64, 64, 128, 4, 16), (64, 64, 64, 4, 8))
+        or (
+            (HAS_INTERMEDIATE_STATES or WEIGHT_DTYPE == "bfloat16")
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        )
+    )
+    use_zero_sleep_wait = thor_bf16_shape and (
+        (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP)
+        in (
+            (64, 128, 128, 4, 8),
+            (64, 64, 128, 4, 16),
+            (64, 64, 128, 4, 64),
+            (64, 64, 64, 4, 8),
+            (64, 64, 96, 4, 8),
+            (64, 64, 128, 2, 8),
+        )
+        or (
+            (INDEX_DTYPE == "int32" or WEIGHT_DTYPE == "bfloat16" or HAS_Z)
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        )
+    )
+    min_blocks = 7
+    if arch.startswith("sm_110"):
+        if HAS_INTERMEDIATE_STATES:
+            min_blocks = 6
+        elif (
+            STATE_DTYPE == "float16"
+            and PHILOX_ROUNDS == 0
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        ):
+            min_blocks = 5
+        elif (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+            STATE_DTYPE,
+            WEIGHT_DTYPE,
+            INDEX_DTYPE,
+            HAS_Z,
+            HAS_D,
+            HAS_DT_BIAS,
+            UPDATE_STATE,
+        ) == (64, 64, 128, 4, 8, "bfloat16", "float32", "int64", False, True, True, True):
+            min_blocks = 10
+        elif (
+            STATE_DTYPE == "bfloat16"
+            and WEIGHT_DTYPE == "bfloat16"
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        ):
+            min_blocks = 10
+        elif (
+            STATE_DTYPE == "bfloat16"
+            and INDEX_DTYPE == "int32"
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        ):
+            min_blocks = 5
+        elif (
+            STATE_DTYPE == "bfloat16"
+            and HAS_Z
+            and (spec["BATCH"], DIM, DSTATE, NTOKENS, HEADS_PER_GROUP) == (64, 64, 128, 4, 8)
+        ):
+            min_blocks = 5
+        elif STATE_DTYPE == "bfloat16" and (spec["BATCH"], DIM, DSTATE, NTOKENS) in (
+            (64, 64, 64, 4),
+            (64, 64, 128, 2),
+        ):
+            min_blocks = 7 if DSTATE == 64 else 8
+        elif STATE_DTYPE == "bfloat16" and (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+        ) == (64, 64, 128, 8, 8):
+            min_blocks = 9
+        elif STATE_DTYPE == "bfloat16" and (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+        ) == (64, 64, 128, 4, 1):
+            min_blocks = 8
+        elif STATE_DTYPE == "bfloat16" and (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+        ) == (64, 64, 128, 4, 16):
+            min_blocks = 6
+        elif STATE_DTYPE == "bfloat16" and (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+        ) == (64, 128, 128, 4, 8):
+            min_blocks = 10
+        elif STATE_DTYPE == "bfloat16" and (
+            spec["BATCH"],
+            DIM,
+            DSTATE,
+            NTOKENS,
+            HEADS_PER_GROUP,
+        ) == (64, 64, 128, 4, 64):
+            min_blocks = 5
 
-    @K.kernel(warps=5, arch="sm_100a", min_blocks_per_sm=7, grid=(spec["BATCH"], spec["NHEADS"]))
+    @K.kernel(
+        warps=5, arch="sm_100a", min_blocks_per_sm=min_blocks, grid=(spec["BATCH"], spec["NHEADS"])
+    )
     def selective_state_update_mtp_horizontal(
         tensor_state: K.TensorMap,
         tensor_b: K.TensorMap,
@@ -405,6 +780,8 @@ def get_kernel(**kwargs: Any):
 
         s_b_words = s_b.view("uint32")
         s_c_words = s_c.view("uint32")
+        if use_direct_state_index:
+            s_state_values = s_state_words.view(STATE_DTYPE)
         empty_barriers = empty.buf
         full_barriers = full.buf
         out_ready_barrier = out_ready.buf
@@ -416,10 +793,9 @@ def get_kernel(**kwargs: Any):
             if PHILOX_ROUNDS > 0 and not IS_PAD:
                 K.ptx.ld.global_.s64(random_seed, rand_seed.ptr_to([0]))
 
-            icache_idx = K.local_scalar("int64", init=state_batch)
             if HAS_INTERMEDIATE_STATES and not IS_PAD:
-                K.assign(
-                    icache_idx, _global_load_index_s64(intermediate_indices, batch_i, INDEX_DTYPE)
+                icache_idx = K.local_scalar(
+                    "int64", init=_global_load_index_s64(intermediate_indices, batch_i, INDEX_DTYPE)
                 )
 
             gload_0 = K.local_scalar("uint32")
@@ -473,7 +849,9 @@ def get_kernel(**kwargs: Any):
             state_pipe = K.PipelineState(2, phase=0)
             with K.unroll(NUM_TMA_LOADS) as tl:
                 _mbarrier_arrive_wait_parity(
-                    full_barriers.ptr_to([state_pipe.stage]), state_pipe.phase
+                    full_barriers.ptr_to([state_pipe.stage]),
+                    state_pipe.phase,
+                    zero_sleep=use_zero_sleep_wait,
                 )
 
                 with K.serial(2) as sp:
@@ -487,16 +865,26 @@ def get_kernel(**kwargs: Any):
                         with K.If(K.And(K.Not(IS_PAD), member_col < DSTATE)):
                             with K.Then():
                                 state_words = K.alloc_local((4,), "uint32")
-                                state_word_index: K.int32 = (
-                                    state_pipe.stage * STATE_STAGE_BYTES
-                                    + (sram_row * DSTATE_PAD + member_col) * STATE_BYTES
-                                ) // 4
+                                if use_direct_state_index:
+                                    state_address = s_state_values.ptr_to(
+                                        [
+                                            state_pipe.stage * (STATE_STAGE_BYTES // STATE_BYTES)
+                                            + sram_row * DSTATE_PAD
+                                            + member_col
+                                        ]
+                                    )
+                                else:
+                                    state_word_index: K.int32 = (
+                                        state_pipe.stage * STATE_STAGE_BYTES
+                                        + (sram_row * DSTATE_PAD + member_col) * STATE_BYTES
+                                    ) // 4
+                                    state_address = s_state_words.ptr_to([state_word_index])
                                 K.ptx.ld.shared.v4.b32(
                                     state_words[0],
                                     state_words[1],
                                     state_words[2],
                                     state_words[3],
-                                    s_state_words.ptr_to([state_word_index]),
+                                    state_address,
                                 )
                                 with K.unroll(PAIRS_PER_TILE_MEMBER) as pair:
                                     if STATE_DTYPE == "bfloat16":
@@ -566,15 +954,23 @@ def get_kernel(**kwargs: Any):
                                     group_words[random_word],
                                 )
 
-                    bc_step_words = K.local_scalar("int32", init=0)
+                    bc_step = K.local_scalar("int32", init=0)
                     x_step = K.local_scalar("int32", init=0)
                     dt_step = K.local_scalar("int32", init=0)
                     out_step = K.local_scalar("int32", init=0)
-                    intermediate_step_base = K.local_scalar(
-                        "int64",
-                        init=icache_idx * K.int64(NTOKENS * NHEADS * DIM * DSTATE)
-                        + K.cast(head * DIM * DSTATE + dd * DSTATE, "int64"),
-                    )
+                    if HAS_INTERMEDIATE_STATES and not IS_PAD:
+                        intermediate_step_addr = K.local_scalar(
+                            "uint64",
+                            init=K.reinterpret(
+                                "uint64",
+                                intermediate_states.ptr_to(
+                                    [
+                                        icache_idx * K.int64(NTOKENS * NHEADS * DIM * DSTATE)
+                                        + K.cast(head * DIM * DSTATE + dd * DSTATE, "int64")
+                                    ]
+                                ),
+                            ),
+                        )
 
                     with K.serial(NTOKENS) as step:
                         dt_value = K.local_scalar("float32")
@@ -606,29 +1002,23 @@ def get_kernel(**kwargs: Any):
                             with K.If(member_col < DSTATE), K.Then():
                                 b_words = K.alloc_local((4,), "uint32")
                                 c_words = K.alloc_local((4,), "uint32")
-                                b_word_index: K.int32 = bc_step_words + member_col // 2
-                                c_word_index: K.int32 = bc_step_words + member_col // 2
+                                if use_direct_bc_index:
+                                    b_address = s_b.ptr_to([bc_step + member_col])
+                                    c_address = s_c.ptr_to([bc_step + member_col])
+                                else:
+                                    b_word_index: K.int32 = bc_step + member_col // 2
+                                    c_word_index: K.int32 = bc_step + member_col // 2
+                                    b_address = s_b_words.ptr_to([b_word_index])
+                                    c_address = s_c_words.ptr_to([c_word_index])
                                 if PAIRS_PER_TILE_MEMBER == 2:
-                                    K.ptx.ld.shared.v2.b32(
-                                        b_words[0], b_words[1], s_b_words.ptr_to([b_word_index])
-                                    )
-                                    K.ptx.ld.shared.v2.b32(
-                                        c_words[0], c_words[1], s_c_words.ptr_to([c_word_index])
-                                    )
+                                    K.ptx.ld.shared.v2.b32(b_words[0], b_words[1], b_address)
+                                    K.ptx.ld.shared.v2.b32(c_words[0], c_words[1], c_address)
                                 else:
                                     K.ptx.ld.shared.v4.b32(
-                                        b_words[0],
-                                        b_words[1],
-                                        b_words[2],
-                                        b_words[3],
-                                        s_b_words.ptr_to([b_word_index]),
+                                        b_words[0], b_words[1], b_words[2], b_words[3], b_address
                                     )
                                     K.ptx.ld.shared.v4.b32(
-                                        c_words[0],
-                                        c_words[1],
-                                        c_words[2],
-                                        c_words[3],
-                                        s_c_words.ptr_to([c_word_index]),
+                                        c_words[0], c_words[1], c_words[2], c_words[3], c_address
                                     )
                                 with K.unroll(PAIRS_PER_TILE_MEMBER) as pair:
                                     b_pair: K.uint64 = _bf16_word_to_f32x2(b_words[pair])
@@ -665,7 +1055,10 @@ def get_kernel(**kwargs: Any):
                                 s_out.ptr_to([out_step + dd]), K.reinterpret("uint32", fma_0)
                             )
 
-                        K.assign(bc_step_words, bc_step_words + DSTATE_PAD // 2)
+                        K.assign(
+                            bc_step,
+                            bc_step + (DSTATE_PAD if use_direct_bc_index else DSTATE_PAD // 2),
+                        )
                         K.assign(x_step, x_step + DIM)
                         K.assign(dt_step, dt_step + 1)
                         K.assign(out_step, out_step + DIM)
@@ -681,45 +1074,48 @@ def get_kernel(**kwargs: Any):
                                         tile * PAIRS_PER_TILE_MEMBER,
                                         random_words,
                                         tile * 8,
-                                        intermediate_states,
-                                        intermediate_step_base + member_col,
+                                        K.reinterpret(
+                                            PointerType(PrimType(STATE_DTYPE), "global"),
+                                            intermediate_step_addr
+                                            + K.cast(member_col * STATE_BYTES, "uint64"),
+                                        ),
                                         STATE_DTYPE=STATE_DTYPE,
                                         PAIRS_PER_TILE_MEMBER=PAIRS_PER_TILE_MEMBER,
                                         PHILOX_ROUNDS=PHILOX_ROUNDS,
                                     )
                             K.assign(
-                                intermediate_step_base,
-                                intermediate_step_base + K.int64(NHEADS * DIM * DSTATE),
+                                intermediate_step_addr,
+                                intermediate_step_addr
+                                + K.uint64(NHEADS * DIM * DSTATE * STATE_BYTES),
                             )
 
-                        with (
-                            K.If(K.And(K.And(UPDATE_STATE, step == NTOKENS - 1), K.Not(IS_PAD))),
-                            K.Then(),
-                        ):
-                            final_base: K.int64 = state_batch * state_stride_batch + K.cast(
-                                head * DIM * DSTATE + dd * DSTATE, "int64"
-                            )
-                            with K.unroll(NUM_TILES) as tile:
-                                member_col: K.int32 = (
-                                    tile * ELEMS_PER_TILE + member * ELEMS_PER_TILE_MEMBER
+                        if UPDATE_STATE and not IS_PAD:
+                            with K.If(step == NTOKENS - 1), K.Then():
+                                final_base: K.int64 = state_batch * state_stride_batch + K.cast(
+                                    head * DIM * DSTATE + dd * DSTATE, "int64"
                                 )
-                                with K.If(member_col < DSTATE), K.Then():
-                                    _store_state_tile(
-                                        state_values,
-                                        tile * PAIRS_PER_TILE_MEMBER,
-                                        random_words,
-                                        tile * 8,
-                                        state,
-                                        final_base + member_col,
-                                        STATE_DTYPE=STATE_DTYPE,
-                                        PAIRS_PER_TILE_MEMBER=PAIRS_PER_TILE_MEMBER,
-                                        PHILOX_ROUNDS=PHILOX_ROUNDS,
+                                with K.unroll(NUM_TILES) as tile:
+                                    member_col: K.int32 = (
+                                        tile * ELEMS_PER_TILE + member * ELEMS_PER_TILE_MEMBER
                                     )
+                                    with K.If(member_col < DSTATE), K.Then():
+                                        _store_state_tile(
+                                            state_values,
+                                            tile * PAIRS_PER_TILE_MEMBER,
+                                            random_words,
+                                            tile * 8,
+                                            state.ptr_to([final_base + member_col]),
+                                            STATE_DTYPE=STATE_DTYPE,
+                                            PAIRS_PER_TILE_MEMBER=PAIRS_PER_TILE_MEMBER,
+                                            PHILOX_ROUNDS=PHILOX_ROUNDS,
+                                        )
 
                 K.ptx.mbarrier.arrive.shared__cta.b64(empty_barriers.ptr_to([state_pipe.stage]))
                 state_pipe.advance()
 
-            _mbarrier_arrive_wait_parity(out_ready_barrier.ptr_to([0]), 0)
+            _mbarrier_arrive_wait_parity(
+                out_ready_barrier.ptr_to([0]), 0, zero_sleep=use_zero_sleep_wait
+            )
             with K.unroll((NTOKENS + 3) // 4) as episode:
                 step: K.int32 = compute_warp + episode * 4
                 with K.If(step < NTOKENS), K.Then():
@@ -840,7 +1236,9 @@ def get_kernel(**kwargs: Any):
             state_pipe = K.PipelineState(2, phase=0)
             with K.unroll(NUM_TMA_LOADS) as tl:
                 _mbarrier_arrive_wait_parity(
-                    empty_barriers.ptr_to([state_pipe.stage]), state_pipe.phase
+                    empty_barriers.ptr_to([state_pipe.stage]),
+                    state_pipe.phase,
+                    zero_sleep=use_zero_sleep_wait,
                 )
                 with K.If(lane == 0), K.Then():
                     if not IS_PAD:
@@ -1002,6 +1400,8 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
 
 
 def _tirx_args(case: dict[str, Any]) -> tuple[Any, ...]:
+    if _use_simple_dispatch(case["spec"], os.environ.get(PREPARE_CUDA_ARCH_ENV, "")):
+        return _simple._tirx_args(case)
     maps = case["tensor_maps"]
     return (
         maps["state"].ptr,
@@ -1067,11 +1467,33 @@ def _run_reference(case: dict[str, Any]) -> torch.Tensor:
     return result
 
 
+def _compile_tirx(config: dict[str, Any]):
+    from tirx_kernels.runner import compile_kernel
+
+    arch = os.environ.get(PREPARE_CUDA_ARCH_ENV, "")
+    spec = _specialization(config)
+    ptxas_level = (
+        _simple_ptxas_level(spec, arch)
+        if _use_simple_dispatch(spec, arch)
+        else _ptxas_level(spec, arch)
+    )
+    previous = os.environ.get("TVM_CUDA_PTXAS_REG_LEVEL")
+    if ptxas_level is not None:
+        os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = ptxas_level
+    try:
+        return compile_kernel(get_kernel(**config))
+    finally:
+        if previous is None:
+            os.environ.pop("TVM_CUDA_PTXAS_REG_LEVEL", None)
+        else:
+            os.environ["TVM_CUDA_PTXAS_REG_LEVEL"] = previous
+
+
 def prepare_bench(**kwargs: Any):
     """Specialize and compile before the workload receives a GPU."""
-    from tirx_kernels.runner import compile_kernel, prepared_gpu_benchmark
+    from tirx_kernels.runner import prepared_gpu_benchmark
 
-    state = {"config": dict(kwargs), "executable": compile_kernel(get_kernel(**kwargs))}
+    state = {"config": dict(kwargs), "executable": _compile_tirx(kwargs)}
     return prepared_gpu_benchmark(run_gpu, state)
 
 
@@ -1087,10 +1509,8 @@ def run_test(**kwargs: Any) -> None:
                 ) from error
             return
         raise AssertionError(f"expected horizontal rejection containing {expected_rejection!r}")
-    from tirx_kernels.runner import compile_kernel
-
     case = prepare_data(**kwargs)
-    executable = compile_kernel(get_kernel(**kwargs))
+    executable = _compile_tirx(kwargs)
     executable(*_tirx_args(case))
     torch.cuda.synchronize()
     _run_reference(case)
