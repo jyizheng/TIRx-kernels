@@ -587,6 +587,14 @@ Grouped workloads show one row per config and one timing column per implementati
 | `decode_b64_k16384_h4_varlen` | tirx | 3136.1864 | msa | 3995.1724 | 1.274 | — |
 | `prefill_b1_k8192_h2` | tirx | 5.7109 | msa | 6.2449 | 1.094 | — |
 
+### mxfp4_quantize
+
+| config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
+|---|---|---:|---|---:|---:|---|
+| `fp16_128x4_m128_k1024` | tirx | 6.7874 | flashinfer | 6.9652 | 1.026 | — |
+| `fp16_128x4_m16384_k7168` | tirx | 1936.2057 | flashinfer | 1948.9107 | 1.007 | — |
+| `fp16_linear_m4096_k4096` | tirx | 344.2575 | flashinfer | 353.9275 | 1.028 | — |
+
 ### selective_state_update_mtp_simple
 
 | config | ours impl | ours (µs) | ref impl | ref (µs) | ref/ours | other impls |
