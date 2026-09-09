@@ -1,0 +1,3 @@
+kernel: agent_evolved_kda_backward_b1_t8192_h96
+configs:
+  - {config: h96_packed_1024x8, default: true, timer: proton}
