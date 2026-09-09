@@ -17,9 +17,9 @@ keeps them in sync.
 
 | Architecture | Kernels |
 |---|---:|
-| `sm_100a` | 103 |
-| `sm_103a` | 98 |
-| `sm_107a` | 94 |
+| `sm_100a` | 104 |
+| `sm_103a` | 99 |
+| `sm_107a` | 95 |
 | `sm_110a` | 12 |
 
 ### Native TIRx
@@ -43,6 +43,15 @@ contract and results.
 
 - **KDA forward:**
   [`agent_evolved_kda_forward_b1_t8192`](tirx_kernels/agent_evolved/kda_forward_b1_t8192.py)
+
+### Optimized re-implementations
+
+Native re-implementations of kernels already in the registry with a faster
+schedule, accepted only when they beat the original on every config; see
+[`tirx_kernels/optimized/README.md`](tirx_kernels/optimized/README.md).
+
+- **Normalization:**
+  [`rmsnorm_opt`](tirx_kernels/optimized/rmsnorm.py)
 
 ### cuDNN Frontend ports
 
