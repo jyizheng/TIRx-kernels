@@ -2486,6 +2486,12 @@ KERNEL_META = {
 def _cfg(**kwargs: Any) -> KDAForwardConfig:
     names = {field.name for field in fields(KDAForwardConfig)}
     values = {name: value for name, value in kwargs.items() if name in names}
+    if "seq_len" in kwargs and "seq_lens" not in values:
+        # agent_evolved_kda_forward_b1_t8192_h96 stores a scalar `seq_len` and
+        # derives `seq_lens` from it as `(seq_len,) * batch_size`. Accept that
+        # spelling so its call sites move to this kernel unchanged; a packing
+        # with unequal lengths can only be given as `seq_lens`.
+        values["seq_lens"] = (int(kwargs["seq_len"]),) * int(values.get("batch_size", 1))
     if "seq_lens" in values:
         values["seq_lens"] = tuple(int(t) for t in values["seq_lens"])
     cfg = KDAForwardConfig(**values)
